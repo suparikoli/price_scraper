@@ -1,0 +1,488 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Unlisted Scraper Admin{% if view == 'company' %} — {{ company.display_name }}{% endif %}</title>
+<style>
+:root { --bg:#0f1115; --panel:#171a21; --border:#272b35; --muted:#8a93a6;
+        --text:#e6e9ef; --accent:#7cc4ff; --accent2:#36c48d; --danger:#ff6b6b; }
+* { box-sizing: border-box; }
+body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+       background:var(--bg); color:var(--text); }
+a { color:var(--accent); text-decoration:none; }
+a:hover { text-decoration:underline; }
+header { padding:18px 28px; border-bottom:1px solid var(--border);
+         display:flex; align-items:center; gap:16px; }
+header h1 { font-size:16px; margin:0; font-weight:600; letter-spacing:.2px;}
+header .crumbs { color:var(--muted); font-size:13px; }
+main { max-width:1100px; margin:28px auto; padding:0 28px; }
+.panel { background:var(--panel); border:1px solid var(--border); border-radius:10px;
+         padding:20px; margin-bottom:20px; }
+.panel h2 { margin:0 0 14px; font-size:14px; text-transform:uppercase; letter-spacing:.8px;
+            color:var(--muted); font-weight:600; }
+label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+input[type=text], input[type=search], textarea {
+  width:100%; padding:9px 12px; background:#0c0e13; color:var(--text);
+  border:1px solid var(--border); border-radius:7px; font:inherit;
+}
+input[type=text]:focus, input[type=search]:focus, textarea:focus {
+  outline:none; border-color:var(--accent);
+}
+textarea { min-height:68px; resize:vertical; }
+button, .btn {
+  padding:8px 14px; border-radius:7px; border:1px solid var(--border);
+  background:#1f2430; color:var(--text); cursor:pointer; font:inherit;
+}
+button:hover { background:#262c3a; }
+button.primary { background:var(--accent); color:#001022; border-color:var(--accent); font-weight:600;}
+button.primary:hover { background:#a4d6ff; }
+button.danger { background:#3a1a1e; color:var(--danger); border-color:#5a252b;}
+button.ghost { background:transparent; }
+.row { display:flex; gap:12px; flex-wrap:wrap; }
+.row > * { flex:1 1 200px; }
+table { width:100%; border-collapse:collapse; }
+th,td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--border); font-size:13px;}
+th { font-weight:600; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.6px;}
+tr:hover td { background:#1b1f28; }
+.pill { display:inline-block; padding:2px 8px; border-radius:20px;
+        background:#1b2a1f; color:var(--accent2); font-size:11px; margin-right:4px;}
+.pill.muted { background:#22242c; color:var(--muted); }
+.source-row { display:grid; grid-template-columns:48px 130px 1fr 1.6fr 60px 90px;
+              gap:10px; align-items:center; padding:10px 0; border-bottom:1px solid var(--border);}
+.source-row.excluded { opacity:0.45; }
+.source-row.excluded .current { text-decoration:line-through; }
+.toggle { display:flex; align-items:center; justify-content:center; }
+.toggle input { width:18px; height:18px; cursor:pointer; accent-color: var(--accent2); }
+.source-row:last-child { border-bottom:none; }
+.source-row .tag { font-weight:600; font-size:13px; }
+.source-row .current { color:var(--accent2); font-family:ui-monospace,monospace; font-size:12px;}
+.source-row .current.empty { color:var(--muted); font-style:italic; }
+.dropdown { position:relative; }
+.dropdown-list {
+  position:absolute; z-index:10; top:100%; left:0; right:0; margin-top:4px;
+  background:#12151c; border:1px solid var(--border); border-radius:7px;
+  max-height:260px; overflow-y:auto; display:none;
+}
+.dropdown-list.open { display:block; }
+.dropdown-list .opt {
+  padding:9px 12px; cursor:pointer; border-bottom:1px solid #1c2029;
+}
+.dropdown-list .opt:hover, .dropdown-list .opt.active { background:#1f2530; }
+.dropdown-list .opt .slug { font-family:ui-monospace,monospace; color:var(--muted); font-size:11px;}
+.runlog { background:#0a0c11; border:1px solid var(--border); border-radius:7px;
+          padding:14px; font:12px/1.5 ui-monospace,monospace; white-space:pre-wrap;
+          max-height:320px; overflow-y:auto; }
+.muted { color:var(--muted); font-size:12px;}
+.inline { display:inline-flex; gap:8px; align-items:center;}
+.idx-pill {
+  display:inline-block; padding:2px 7px; border-radius:16px; background:#1a2330;
+  color:var(--muted); font-size:11px; font-family:ui-monospace,monospace;
+}
+.idx-pill.ok { background:#1b2a1f; color:var(--accent2);}
+.idx-pill.empty { background:#2a1f1f; color:var(--danger);}
+hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
+</style>
+</head>
+<body>
+<header>
+  <h1>Unlisted Scraper Admin</h1>
+  <span class="crumbs">
+    <a href="{{ url_for('home') }}">Home</a>
+    {% if view == 'company' %} · {{ company.isin }}{% endif %}
+  </span>
+</header>
+
+<main>
+
+{% if view == 'home' %}
+
+  <div class="panel">
+    <h2>Search companies</h2>
+    <input type="search" id="searchBox" placeholder="Type ISIN, display name, or alias (e.g. pharmeasy, INE0DJ201029)">
+    <div id="searchResults" style="margin-top:12px;"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Add / update company</h2>
+    <form id="newCompanyForm">
+      <div class="row">
+        <div>
+          <label>ISIN</label>
+          <input type="text" name="isin" placeholder="INE0DJ201029" required>
+        </div>
+        <div style="flex:2">
+          <label>Display name</label>
+          <input type="text" name="display_name" placeholder="API Holdings" required>
+        </div>
+      </div>
+      <div style="margin-top:10px;">
+        <label>Aliases (comma, newline or pipe separated)</label>
+        <textarea name="aliases" placeholder="PharmEasy, Thyrocare, Retailio, Aknamed, Docon"></textarea>
+      </div>
+      <div style="margin-top:10px;">
+        <label>Notes</label>
+        <textarea name="notes"></textarea>
+      </div>
+      <div style="margin-top:14px;">
+        <button class="primary" type="submit">Save</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="panel">
+    <h2>Source index cache</h2>
+    <p class="muted">Local cache of each site's company list used for fuzzy slug search. Refresh as needed (rarely).</p>
+    <div class="row">
+      {% for src in sources %}
+      <div style="flex:1 1 160px;">
+        <div class="inline" style="justify-content:space-between;">
+          <strong>{{ src }}</strong>
+          {% set cnt = index_counts.get(src, 0) %}
+          <span class="idx-pill {% if cnt %}ok{% else %}empty{% endif %}">{{ cnt }}</span>
+        </div>
+        <button class="ghost" style="margin-top:6px; width:100%;" onclick="refreshIndex('{{ src }}', this)">Refresh</button>
+      </div>
+      {% endfor %}
+    </div>
+    <hr>
+    <button onclick="refreshAll(this)">↻ Refresh all</button>
+  </div>
+
+  <div class="panel">
+    <h2>Companies ({{ companies | length }})</h2>
+    {% if companies %}
+    <table>
+      <thead><tr><th>ISIN</th><th>Name</th><th>Sources</th><th>Updated</th><th></th></tr></thead>
+      <tbody>
+      {% for c in companies %}
+      <tr>
+        <td style="font-family:ui-monospace,monospace;">{{ c.isin }}</td>
+        <td>{{ c.display_name }}</td>
+        <td><span class="pill">{{ c.configured_sources }}/{{ sources|length }}</span></td>
+        <td class="muted">{{ c.updated_at }}</td>
+        <td><a href="{{ url_for('view_company', isin=c.isin) }}">Open →</a></td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="muted">No companies yet. Add one above.</p>
+    {% endif %}
+  </div>
+
+{% elif view == 'company' %}
+
+  <div class="panel">
+    <h2>Identity</h2>
+    <form id="companyForm">
+      <input type="hidden" name="isin_original" value="{{ company.isin }}">
+      <div class="row">
+        <div>
+          <label>ISIN</label>
+          <input type="text" name="isin" value="{{ company.isin }}" readonly
+                 style="font-family:ui-monospace,monospace; background:#0a0c11;">
+        </div>
+        <div style="flex:2">
+          <label>Display name</label>
+          <input type="text" name="display_name" value="{{ company.display_name }}" required>
+        </div>
+      </div>
+      <div style="margin-top:10px;">
+        <label>Aliases (comma, newline or pipe separated)</label>
+        <textarea name="aliases">{{ company.aliases | join(', ') }}</textarea>
+      </div>
+      <div style="margin-top:10px;">
+        <label>Notes</label>
+        <textarea name="notes">{{ company.notes }}</textarea>
+      </div>
+      <div style="margin-top:14px;" class="inline">
+        <button class="primary" type="submit">Save identity</button>
+        <button class="danger" type="button" onclick="deleteCompany()">Delete</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="panel">
+    <h2>Sources &amp; slugs</h2>
+    <p class="muted">
+      Type a name to fuzzy-search each site's cached index, paste a slug, or
+      paste a full URL. Use the checkbox to <strong>include / exclude a source
+      from <code>combined.csv</code></strong> — toggling rebuilds combined.csv
+      immediately from existing per-source files.
+    </p>
+    {% for src in sources %}
+    {% set current = company.slugs.get(src, '') %}
+    {% set page_url = source_urls.get(src) %}
+    {% set is_excluded = src in company.excluded %}
+    <div class="source-row {% if is_excluded %}excluded{% endif %}" data-row-source="{{ src }}">
+      <div class="toggle" title="Include in combined.csv">
+        <input type="checkbox" {% if not is_excluded %}checked{% endif %}
+               onchange="toggleExclude('{{ src }}', this)">
+      </div>
+      <div class="tag">{{ src }}</div>
+      <div class="dropdown" data-source="{{ src }}">
+        {% if src in auto_sources %}
+          <input type="search" placeholder="Search {{ src }} or paste URL…"
+                 oninput="sourceSearch(this)" onfocus="sourceSearch(this)"
+                 onchange="manualSourceInput(this)"
+                 autocomplete="off">
+          <div class="dropdown-list"></div>
+          <div class="muted" style="margin-top:4px;">
+            {% if src in live_search %}
+              live search · or paste a full {{ src }} URL
+            {% else %}
+              {% set cnt = index_counts.get(src, 0) %}
+              {% if cnt %}{{ cnt }} entries cached · or paste a full URL{% else %}⚠ index empty — refresh from home, or paste a full URL{% endif %}
+            {% endif %}
+          </div>
+        {% else %}
+          <input type="search" placeholder="Paste slug or full URL…"
+                 oninput="manualSourceInput(this)" value="{{ current }}">
+          <div class="muted" style="margin-top:4px;">
+            Manual source — <a href="#" onclick="openSite('{{ src }}', this)">↗ Open site search</a>
+          </div>
+        {% endif %}
+      </div>
+      <div class="current {% if not current %}empty{% endif %}" title="{{ current }}">
+        {% if current %}{{ current }}{% else %}(not configured){% endif %}
+      </div>
+      <div style="text-align:center;">
+        {% if page_url %}
+          <a class="btn" target="_blank" rel="noopener" href="{{ page_url }}" title="Open the {{ src }} page in a new tab">↗ Open</a>
+        {% else %}
+          <span class="muted">—</span>
+        {% endif %}
+      </div>
+      <div style="text-align:right;">
+        {% if current %}
+          <button class="ghost" onclick="clearSlug('{{ src }}', this)">Clear</button>
+        {% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="panel">
+    <h2>Run scraper</h2>
+    <p class="muted">
+      Hits all configured sources and writes files under
+      <code>extracted/{{ company.isin }}/</code> (per-source + <code>combined.csv</code>).
+      CSV schema: <code>Datetime;Price;Source;Tag;Note;Link</code>.
+    </p>
+    <button class="primary" id="runBtn" onclick="runScrape()">▶ Run scraper</button>
+    <a id="combinedLink" class="btn" style="margin-left:10px; display:none;" href="#">⬇ Download combined.csv</a>
+    <div id="runLog" class="runlog" style="margin-top:14px; display:none;"></div>
+    <div id="sourceFiles" style="margin-top:12px; display:none;"></div>
+  </div>
+
+{% endif %}
+
+</main>
+
+<script>
+const ISIN = {% if view == 'company' %}"{{ company.isin }}"{% else %}null{% endif %};
+
+// ---------- home: search ----------
+const searchBox = document.getElementById('searchBox');
+if (searchBox) {
+  let t;
+  searchBox.addEventListener('input', () => {
+    clearTimeout(t);
+    t = setTimeout(runSearch, 150);
+  });
+}
+async function runSearch() {
+  const q = searchBox.value.trim();
+  const box = document.getElementById('searchResults');
+  if (!q) { box.innerHTML = ''; return; }
+  const res = await fetch('/search?q=' + encodeURIComponent(q));
+  const items = await res.json();
+  if (!items.length) {
+    box.innerHTML = '<div class="muted">No matches. Add the company below.</div>';
+    return;
+  }
+  box.innerHTML = '<table><thead><tr><th>ISIN</th><th>Name</th><th>Aliases</th><th>Score</th><th></th></tr></thead><tbody>'
+    + items.map(c => `
+      <tr>
+        <td style="font-family:ui-monospace,monospace;">${c.isin}</td>
+        <td>${esc(c.display_name)}</td>
+        <td class="muted">${c.aliases.slice(0,4).map(esc).join(', ')}${c.aliases.length>4 ? '…' : ''}</td>
+        <td><span class="pill muted">${c.score}</span></td>
+        <td><a href="/company/${c.isin}">Open →</a></td>
+      </tr>`).join('')
+    + '</tbody></table>';
+}
+
+// ---------- home: new company form ----------
+const newForm = document.getElementById('newCompanyForm');
+if (newForm) {
+  newForm.addEventListener('submit', async e => {
+    e.preventDefault();
+    const r = await fetch('/company', {method:'POST', body: new FormData(newForm)});
+    const j = await r.json();
+    if (j.ok) location.href = j.redirect;
+    else alert(await r.text());
+  });
+}
+
+// ---------- index refresh ----------
+async function refreshIndex(source, btn) {
+  btn.disabled = true; btn.textContent = 'Refreshing…';
+  const r = await fetch('/admin/refresh-index/' + source, {method:'POST'});
+  const j = await r.json();
+  btn.disabled = false;
+  btn.textContent = j.ok ? `Refreshed (${j.count})` : 'Failed';
+  setTimeout(() => { location.reload(); }, 600);
+}
+async function refreshAll(btn) {
+  btn.disabled = true; btn.textContent = 'Refreshing all…';
+  const r = await fetch('/admin/refresh-all', {method:'POST'});
+  const j = await r.json();
+  alert('Refresh done:\n' + JSON.stringify(j, null, 2));
+  location.reload();
+}
+
+// ---------- company: identity form ----------
+const companyForm = document.getElementById('companyForm');
+if (companyForm) {
+  companyForm.addEventListener('submit', async e => {
+    e.preventDefault();
+    const r = await fetch('/company', {method:'POST', body: new FormData(companyForm)});
+    const j = await r.json();
+    if (j.ok) { alert('Saved'); location.reload(); }
+    else alert(await r.text());
+  });
+}
+async function deleteCompany() {
+  if (!confirm('Delete this company and all its slugs?')) return;
+  const r = await fetch(`/company/${ISIN}/delete`, {method:'POST'});
+  const j = await r.json();
+  if (j.ok) location.href = j.redirect;
+}
+
+// ---------- company: per-source search ----------
+let searchTimers = {};
+async function sourceSearch(input) {
+  const wrap = input.closest('.dropdown');
+  const src = wrap.dataset.source;
+  const list = wrap.querySelector('.dropdown-list');
+  const q = input.value.trim();
+  clearTimeout(searchTimers[src]);
+  if (!q) { list.classList.remove('open'); list.innerHTML=''; return; }
+  searchTimers[src] = setTimeout(async () => {
+    const r = await fetch(`/source/${src}/search?q=` + encodeURIComponent(q));
+    const items = await r.json();
+    if (!items.length) {
+      list.innerHTML = '<div class="opt muted">No matches</div>';
+    } else {
+      list.innerHTML = items.map(it => `
+        <div class="opt" onclick='pickSlug("${src}", ${JSON.stringify(it.slug)})'>
+          <div>${esc(it.display)} <span class="pill muted">${it.score}</span></div>
+          <div class="slug">${esc(it.slug)}</div>
+        </div>`).join('');
+    }
+    list.classList.add('open');
+  }, 120);
+}
+async function pickSlug(source, slug) {
+  const fd = new FormData();
+  fd.append('source', source);
+  fd.append('slug', slug);
+  const r = await fetch(`/company/${ISIN}/slug`, {method:'POST', body: fd});
+  const j = await r.json();
+  if (j.ok) location.reload();
+}
+async function manualSourceInput(input) {
+  // debounce save
+  const wrap = input.closest('.dropdown');
+  const src = wrap.dataset.source;
+  clearTimeout(searchTimers[src]);
+  searchTimers[src] = setTimeout(async () => {
+    const fd = new FormData();
+    fd.append('source', src);
+    fd.append('slug', input.value.trim());
+    await fetch(`/company/${ISIN}/slug`, {method:'POST', body: fd});
+  }, 500);
+}
+async function clearSlug(source, btn) {
+  const fd = new FormData();
+  fd.append('source', source);
+  fd.append('slug', '');
+  await fetch(`/company/${ISIN}/slug`, {method:'POST', body: fd});
+  location.reload();
+}
+async function toggleExclude(source, checkbox) {
+  const fd = new FormData();
+  fd.append('source', source);
+  fd.append('included', checkbox.checked ? 'true' : 'false');
+  const r = await fetch(`/company/${ISIN}/exclude`, {method:'POST', body: fd});
+  const j = await r.json();
+  // Visual feedback
+  const row = document.querySelector(`.source-row[data-row-source="${source}"]`);
+  if (row) row.classList.toggle('excluded', !checkbox.checked);
+  // If we have a rebuild result, briefly flash the row count in the run log
+  if (j.rebuild) {
+    const log = document.getElementById('runLog');
+    if (log) {
+      log.style.display = 'block';
+      log.textContent = `combined.csv rebuilt: ${j.rebuild.rows} rows ` +
+        `(included: ${j.rebuild.included.join(', ')}` +
+        (j.rebuild.excluded.length ? `; excluded: ${j.rebuild.excluded.join(', ')}` : '') + ')';
+    }
+  }
+}
+
+function openSite(source, link) {
+  const urls = {
+    unlistedzone:  'https://unlistedzone.com/shares/?search=',
+    altmoneyvault: 'https://altmoneyvault.com/?s=',
+  };
+  const wrap = link.closest('.source-row').querySelector('.dropdown input');
+  const q = wrap.value || '';
+  window.open(urls[source] + encodeURIComponent(q), '_blank');
+}
+
+// close dropdowns on outside click
+document.addEventListener('click', e => {
+  if (e.target.closest('.dropdown')) return;
+  document.querySelectorAll('.dropdown-list.open').forEach(d => d.classList.remove('open'));
+});
+
+// ---------- company: run scraper ----------
+async function runScrape() {
+  const btn = document.getElementById('runBtn');
+  const log = document.getElementById('runLog');
+  const link = document.getElementById('combinedLink');
+  const files = document.getElementById('sourceFiles');
+  btn.disabled = true; btn.textContent = '⏳ Scraping all sources…';
+  log.style.display = 'block';
+  log.textContent = 'Running…';
+  try {
+    const r = await fetch(`/company/${ISIN}/run`, {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      log.textContent = 'Error: ' + (j.error || 'unknown');
+    } else {
+      const s = j.summary;
+      let txt = `Scraped ${s.total} rows\n\nPer-source:\n`;
+      for (const [k,v] of Object.entries(s.counts)) txt += `  ${k.padEnd(14)} ${v}\n`;
+      log.textContent = txt;
+      link.href = s.combined_url;
+      link.style.display = 'inline-block';
+      files.style.display = 'block';
+      files.innerHTML = '<div class="muted" style="margin-bottom:6px;">Per-source files:</div>' +
+        Object.entries(s.source_urls || {}).map(([src, url]) =>
+          `<a class="btn" style="margin:4px 6px 0 0;" href="${url}">${src}.csv</a>`
+        ).join('');
+    }
+  } catch (e) {
+    log.textContent = 'Error: ' + e.message;
+  }
+  btn.disabled = false; btn.textContent = '▶ Run scraper';
+}
+
+// ---------- util ----------
+function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+</script>
+</body>
+</html>
