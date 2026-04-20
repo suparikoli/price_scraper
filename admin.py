@@ -14,8 +14,10 @@ Then open http://127.0.0.1:8765
 
 import json
 import pathlib
+import platform
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -160,6 +162,65 @@ def get_company(isin):
     return company_row_to_dict(row, aliases)
 
 
+def _scrape_status(isin):
+    """Inspect extracted/{ISIN}/ to report what's been scraped.
+
+    Returns a dict with:
+      combined_exists  — True if a *_combined.csv sits at the folder root
+      combined_rows    — row count of that CSV (excluding header)
+      combined_name    — its filename
+      combined_mtime   — ISO timestamp of last modification
+      source_count     — number of per-source CSVs present
+    """
+    folder = EXTRACTED_DIR / isin.upper()
+    status = {
+        "combined_exists": False,
+        "combined_rows": 0,
+        "combined_name": None,
+        "combined_mtime": None,
+        "source_count": 0,
+    }
+    if not folder.exists():
+        return status
+    # combined file — take the newest *_combined.csv at folder root
+    combined_files = sorted(
+        folder.glob("*_combined.csv"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    # also check legacy `combined.csv` just in case
+    legacy = folder / "combined.csv"
+    if legacy.exists() and legacy not in combined_files:
+        combined_files.append(legacy)
+    if combined_files:
+        cf = combined_files[0]
+        status["combined_exists"] = True
+        status["combined_name"] = cf.name
+        stat = cf.stat()
+        status["combined_mtime"] = time.strftime(
+            "%Y-%m-%d %H:%M", time.localtime(stat.st_mtime)
+        )
+        # row count (cheap): -1 for header if > 0
+        try:
+            with cf.open() as fp:
+                rows = sum(1 for _ in fp)
+            status["combined_rows"] = max(0, rows - 1)
+        except OSError:
+            pass
+    # per-source files under sources/ (new layout) or folder root (legacy)
+    sources_dir = folder / "sources"
+    if sources_dir.exists():
+        status["source_count"] = sum(
+            1 for p in sources_dir.glob("*.csv") if p.is_file()
+        )
+    else:
+        status["source_count"] = sum(
+            1 for p in folder.glob("*.csv")
+            if p.is_file() and not p.name.endswith("_combined.csv") and p.name != "combined.csv"
+        )
+    return status
+
+
 def list_companies():
     with db() as c:
         rows = c.execute(
@@ -168,11 +229,17 @@ def list_companies():
         out = []
         for r in rows:
             slugs = json.loads(r["slugs_json"] or "{}")
+            status = _scrape_status(r["isin"])
             out.append({
                 "isin": r["isin"],
                 "display_name": r["display_name"],
                 "configured_sources": sum(1 for v in slugs.values() if v),
                 "updated_at": r["updated_at"],
+                "scraped": status["combined_exists"],
+                "combined_rows": status["combined_rows"],
+                "combined_name": status["combined_name"],
+                "combined_mtime": status["combined_mtime"],
+                "source_count": status["source_count"],
             })
     return out
 
@@ -587,15 +654,92 @@ def run_scraper(isin):
     if not sources:
         return jsonify({"ok": False, "error": "No slugs configured"}), 400
     try:
-        summary = scrape_prices.scrape(isin, sources, excluded=company["excluded"])
+        summary = scrape_prices.scrape(
+            isin,
+            sources,
+            excluded=company["excluded"],
+            company_name=company.get("display_name", ""),
+        )
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-    summary["combined_url"] = url_for("download_file", isin=isin, name="combined.csv")
+    combined_name = summary.get("files", {}).get("combined_name") or pathlib.Path(
+        summary.get("combined") or ""
+    ).name or "combined.csv"
+    summary["combined_url"] = url_for("download_file", isin=isin, name=combined_name)
     summary["source_urls"] = {
-        src: url_for("download_file", isin=isin, name=f"{src}.csv")
+        src: url_for("download_file", isin=isin, name=f"sources/{src}.csv")
         for src in sources
     }
+    try:
+        summary["audit"] = scrape_prices.audit_sources(isin)
+    except Exception as e:
+        summary["audit_error"] = str(e)
     return jsonify({"ok": True, "summary": summary})
+
+
+@app.route("/company/<isin>/audit")
+def audit_company(isin):
+    isin = isin.upper()
+    if not get_company(isin):
+        abort(404)
+    try:
+        return jsonify({"ok": True, "audit": scrape_prices.audit_sources(isin)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/company/<isin>/reveal", methods=["POST"])
+def reveal_folder(isin):
+    """Open the extracted/{ISIN}/ folder in the OS file manager
+    (Finder on macOS, Explorer on Windows, xdg-open on Linux)."""
+    isin = isin.upper()
+    company = get_company(isin)
+    if not company:
+        abort(404)
+    folder = EXTRACTED_DIR / isin
+    if not folder.exists():
+        return jsonify({"ok": False, "error": "Folder not created yet — run the scraper first."}), 404
+    folder_str = str(folder)
+    try:
+        sysname = platform.system()
+        if sysname == "Darwin":
+            subprocess.Popen(["open", folder_str])
+        elif sysname == "Windows":
+            subprocess.Popen(["explorer", folder_str])
+        else:
+            subprocess.Popen(["xdg-open", folder_str])
+        return jsonify({"ok": True, "folder": folder_str})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "folder": folder_str}), 500
+
+
+@app.route("/company/<isin>/rebuild", methods=["POST"])
+def rebuild_combined_route(isin):
+    """Force-rebuild the combined CSV from existing per-source files,
+    applying the currently stored exclusion list (which may be empty).
+    Works whether or not any exclusions are active."""
+    isin = isin.upper()
+    company = get_company(isin)
+    if not company:
+        abort(404)
+    excluded = company.get("excluded") or []
+    try:
+        rebuild = scrape_prices.rebuild_combined(
+            isin,
+            excluded=excluded,
+            company_name=company.get("display_name", ""),
+        )
+        try:
+            rebuild["audit"] = scrape_prices.audit_sources(isin)
+        except Exception:
+            pass
+        combined_name = rebuild.get("combined_name") or pathlib.Path(rebuild["combined"]).name
+        rebuild["combined_url"] = url_for("download_file", isin=isin, name=combined_name)
+        return jsonify({"ok": True, "rebuild": rebuild})
+    except FileNotFoundError:
+        return jsonify({"ok": False, "error": "No scraped data yet — run the scraper first."}), 404
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/company/<isin>/exclude", methods=["POST"])
@@ -606,8 +750,16 @@ def update_exclude(isin):
     excluded = set_excluded(isin, source, included)
     # Auto-rebuild combined.csv from existing per-source files (if any).
     rebuild = None
+    company = get_company(isin)
+    display_name = (company or {}).get("display_name", "")
     try:
-        rebuild = scrape_prices.rebuild_combined(isin, excluded=excluded)
+        rebuild = scrape_prices.rebuild_combined(
+            isin, excluded=excluded, company_name=display_name
+        )
+        try:
+            rebuild["audit"] = scrape_prices.audit_sources(isin)
+        except Exception:
+            pass
     except FileNotFoundError:
         pass  # nothing scraped yet
     except Exception as e:
@@ -616,11 +768,16 @@ def update_exclude(isin):
     return jsonify({"ok": True, "excluded": excluded, "rebuild": rebuild})
 
 
-@app.route("/extracted/<isin>/<name>")
+@app.route("/extracted/<isin>/<path:name>")
 def download_file(isin, name):
     folder = EXTRACTED_DIR / isin.upper()
     path = folder / name
-    if not path.exists() or not str(path.resolve()).startswith(str(folder.resolve())):
+    # Resolve and make sure it still lives under the ISIN folder (no ../ escapes).
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError:
+        abort(404)
+    if not str(resolved).startswith(str(folder.resolve())):
         abort(404)
     return send_from_directory(folder, name, as_attachment=True)
 

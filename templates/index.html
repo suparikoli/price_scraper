@@ -149,17 +149,47 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
   </div>
 
   <div class="panel">
-    <h2>Companies ({{ companies | length }})</h2>
+    {% set scraped_count = companies | selectattr('scraped') | list | length %}
+    {% set not_scraped = companies | rejectattr('scraped') | list %}
+    <h2>
+      Companies ({{ companies | length }})
+      <span class="status-pill ok" style="margin-left:10px;">✓ Scraped: {{ scraped_count }}</span>
+      <span class="status-pill {% if not_scraped %}warn{% else %}ok{% endif %}" style="margin-left:6px;">
+        ✗ Not scraped: {{ not_scraped | length }}
+      </span>
+    </h2>
+    {% if not_scraped %}
+    <div class="banner">
+      <strong>⚠ {{ not_scraped | length }} companies still need scraping:</strong>
+      {% for c in not_scraped %}
+        <a href="{{ url_for('view_company', isin=c.isin) }}" class="chip">{{ c.display_name }}</a>
+      {% endfor %}
+    </div>
+    {% endif %}
     {% if companies %}
-    <table>
-      <thead><tr><th>ISIN</th><th>Name</th><th>Sources</th><th>Updated</th><th></th></tr></thead>
+    <div class="inline" style="margin-bottom:10px; gap:6px; flex-wrap:wrap;">
+      <button class="ghost" onclick="filterCompanies('all', this)">All</button>
+      <button class="ghost" onclick="filterCompanies('scraped', this)">Scraped</button>
+      <button class="ghost" onclick="filterCompanies('not_scraped', this)">Not scraped</button>
+    </div>
+    <table id="companiesTable">
+      <thead><tr><th>ISIN</th><th>Name</th><th>Sources</th><th>Scraped?</th><th>Rows</th><th>Last scraped</th><th></th></tr></thead>
       <tbody>
       {% for c in companies %}
-      <tr>
+      <tr data-scraped="{{ 'yes' if c.scraped else 'no' }}"
+          {% if not c.scraped %}style="background:#fff7ed;"{% endif %}>
         <td style="font-family:ui-monospace,monospace;">{{ c.isin }}</td>
         <td>{{ c.display_name }}</td>
         <td><span class="pill">{{ c.configured_sources }}/{{ sources|length }}</span></td>
-        <td class="muted">{{ c.updated_at }}</td>
+        <td>
+          {% if c.scraped %}
+            <span class="status-pill ok">✓ yes</span>
+          {% else %}
+            <span class="status-pill warn">✗ no</span>
+          {% endif %}
+        </td>
+        <td class="muted">{{ '{:,}'.format(c.combined_rows) if c.scraped else '—' }}</td>
+        <td class="muted">{{ c.combined_mtime or '—' }}</td>
         <td><a href="{{ url_for('view_company', isin=c.isin) }}">Open →</a></td>
       </tr>
       {% endfor %}
@@ -169,6 +199,15 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
       <p class="muted">No companies yet. Add one above.</p>
     {% endif %}
   </div>
+
+  <style>
+    .status-pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600}
+    .status-pill.ok{background:#dcfce7;color:#166534}
+    .status-pill.warn{background:#fee2e2;color:#991b1b}
+    .banner{background:#fff7ed;border:1px solid #f59e0b;border-radius:8px;padding:10px 12px;margin-bottom:12px}
+    .banner .chip{display:inline-block;background:#fff;border:1px solid #f59e0b;color:#7c2d12;padding:3px 10px;margin:4px 4px 0 0;border-radius:999px;font-size:13px;text-decoration:none}
+    .banner .chip:hover{background:#fef3c7}
+  </style>
 
 {% elif view == 'company' %}
 
@@ -210,6 +249,20 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
       from <code>combined.csv</code></strong> — toggling rebuilds combined.csv
       immediately from existing per-source files.
     </p>
+    <div class="inline" style="margin-bottom:10px; gap:6px; flex-wrap:wrap;">
+      <button class="primary" onclick="openAllSources(this)" title="Open every configured source page in a new tab">
+        ↗ Open all sources
+      </button>
+      <button class="ghost" onclick="autoSearchAll()" title="Fill every empty search box with the first 5 letters of the company name and run fuzzy search">
+        ✨ Auto-search empty sources
+      </button>
+      {% if company.aliases %}
+        {% for a in company.aliases[:4] %}
+          <button class="ghost" onclick="autoSearchAll(this.dataset.q)" data-q="{{ a }}" title="Auto-search using alias: {{ a }}">🔎 {{ a[:18] }}</button>
+        {% endfor %}
+      {% endif %}
+      <span class="muted" style="margin-left:4px;">Query auto-fills empty boxes only — existing slugs are left alone.</span>
+    </div>
     {% for src in sources %}
     {% set current = company.slugs.get(src, '') %}
     {% set page_url = source_urls.get(src) %}
@@ -271,9 +324,26 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
     </p>
     <button class="primary" id="runBtn" onclick="runScrape()">▶ Run scraper</button>
     <a id="combinedLink" class="btn" style="margin-left:10px; display:none;" href="#">⬇ Download combined.csv</a>
+    <button class="ghost" id="rebuildBtn" style="margin-left:10px;" onclick="rebuildCombined()">↻ Regenerate combined</button>
+    <button class="ghost" id="revealBtn" style="margin-left:10px;" onclick="revealFolder()">📂 Open folder</button>
+    <button class="ghost" id="auditBtn" style="margin-left:10px; display:none;" onclick="refreshAudit()">🔍 Re-check data quality</button>
     <div id="runLog" class="runlog" style="margin-top:14px; display:none;"></div>
+    <div id="auditBox" style="margin-top:14px; display:none;"></div>
     <div id="sourceFiles" style="margin-top:12px; display:none;"></div>
   </div>
+
+  <style>
+    .audit-banner{padding:10px 12px;border-radius:8px;margin-bottom:10px;font-weight:600}
+    .audit-banner.warn{background:#fef3c7;border:1px solid #f59e0b;color:#7c2d12}
+    .audit-banner.ok{background:#dcfce7;border:1px solid #16a34a;color:#14532d}
+    .audit-row{display:grid;grid-template-columns:130px 90px 110px 1fr auto;gap:10px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;margin-bottom:6px;align-items:center;font-size:14px}
+    .audit-row.suspect{background:#fef2f2;border-color:#ef4444}
+    .audit-row.ok{background:#f0fdf4}
+    .audit-row .badge{padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600}
+    .audit-row .badge.red{background:#fee2e2;color:#991b1b}
+    .audit-row .badge.green{background:#dcfce7;color:#166534}
+    .audit-row .badge.gray{background:#e5e7eb;color:#374151}
+  </style>
 
 {% endif %}
 
@@ -281,6 +351,8 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
 
 <script>
 const ISIN = {% if view == 'company' %}"{{ company.isin }}"{% else %}null{% endif %};
+const DISPLAY_NAME = {% if view == 'company' %}{{ company.display_name|tojson }}{% else %}""{% endif %};
+const ALIASES = {% if view == 'company' %}{{ company.aliases|tojson }}{% else %}[]{% endif %};
 
 // ---------- home: search ----------
 const searchBox = document.getElementById('searchBox');
@@ -469,16 +541,196 @@ async function runScrape() {
       log.textContent = txt;
       link.href = s.combined_url;
       link.style.display = 'inline-block';
+      document.getElementById('auditBtn').style.display = 'inline-block';
       files.style.display = 'block';
       files.innerHTML = '<div class="muted" style="margin-bottom:6px;">Per-source files:</div>' +
         Object.entries(s.source_urls || {}).map(([src, url]) =>
           `<a class="btn" style="margin:4px 6px 0 0;" href="${url}">${src}.csv</a>`
         ).join('');
+      renderAudit(s.audit);
     }
   } catch (e) {
     log.textContent = 'Error: ' + e.message;
   }
   btn.disabled = false; btn.textContent = '▶ Run scraper';
+}
+
+// ---------- company: data-quality audit ----------
+function renderAudit(audit) {
+  const box = document.getElementById('auditBox');
+  if (!audit || !audit.sources) { box.style.display = 'none'; return; }
+  const entries = Object.entries(audit.sources)
+    .sort((a,b) => (b[1].deviation_pct||0) - (a[1].deviation_pct||0));
+  const suspects = audit.suspects || [];
+  const combinedLink = document.getElementById('combinedLink');
+  let html = '';
+  if (suspects.length) {
+    html += `<div class="audit-banner warn">⚠ ${suspects.length} source(s) look wrong for this ISIN — exclude before downloading combined: <strong>${suspects.join(', ')}</strong></div>`;
+    combinedLink.textContent = '⚠ Download combined.csv (with warnings)';
+  } else {
+    html += `<div class="audit-banner ok">✓ All sources look consistent for this ISIN — safe to download combined.csv</div>`;
+    combinedLink.textContent = '⬇ Download combined.csv';
+  }
+  for (const [src, r] of entries) {
+    const cls = r.suspect ? 'suspect' : (r.shared_days >= 5 ? 'ok' : '');
+    const badge = r.suspect ? 'red' : (r.shared_days >= 5 ? 'green' : 'gray');
+    const ratio = r.median_ratio == null ? '—' : `${r.median_ratio}×`;
+    const label = r.suspect ? 'SUSPECT' : (r.shared_days >= 5 ? 'OK' : 'low data');
+    const excludeBtn = r.suspect
+      ? `<button class="danger" onclick="excludeFromAudit('${src}', this)">Exclude from combined</button>`
+      : '';
+    html += `<div class="audit-row ${cls}">
+      <strong>${esc(src)}</strong>
+      <span class="badge ${badge}">${label}</span>
+      <span class="muted">ratio ${ratio}</span>
+      <span class="muted">${r.deviated_days}/${r.shared_days} days off (${r.deviation_pct}%)</span>
+      <div>${excludeBtn}</div>
+    </div>`;
+  }
+  box.innerHTML = html;
+  box.style.display = 'block';
+}
+
+async function refreshAudit() {
+  try {
+    const r = await fetch(`/company/${ISIN}/audit`);
+    const j = await r.json();
+    if (j.ok) renderAudit(j.audit);
+  } catch (e) { /* noop */ }
+}
+
+async function rebuildCombined() {
+  const btn = document.getElementById('rebuildBtn');
+  const log = document.getElementById('runLog');
+  const link = document.getElementById('combinedLink');
+  btn.disabled = true; btn.textContent = '⏳ Rebuilding…';
+  log.style.display = 'block';
+  try {
+    const r = await fetch(`/company/${ISIN}/rebuild`, {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      log.textContent = 'Rebuild error: ' + (j.error || 'unknown');
+    } else {
+      const rb = j.rebuild || {};
+      log.textContent = `Combined rebuilt: ${rb.rows} rows` +
+        (rb.excluded && rb.excluded.length ? ` (excluded: ${rb.excluded.join(', ')})` : ' (no exclusions)') +
+        `\nFile: ${rb.combined_name || rb.combined}`;
+      if (rb.combined_url) {
+        link.href = rb.combined_url;
+        link.style.display = 'inline-block';
+      }
+      document.getElementById('auditBtn').style.display = 'inline-block';
+      if (rb.audit) renderAudit(rb.audit);
+    }
+  } catch (e) {
+    log.textContent = 'Rebuild error: ' + e.message;
+  }
+  btn.disabled = false; btn.textContent = '↻ Regenerate combined';
+}
+
+async function revealFolder() {
+  const btn = document.getElementById('revealBtn');
+  const log = document.getElementById('runLog');
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/company/${ISIN}/reveal`, {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      log.style.display = 'block';
+      log.textContent = 'Open-folder error: ' + (j.error || 'unknown') +
+        (j.folder ? `\nExpected path: ${j.folder}` : '');
+    }
+  } catch (e) {
+    log.style.display = 'block';
+    log.textContent = 'Open-folder error: ' + e.message;
+  }
+  btn.disabled = false;
+}
+
+async function excludeFromAudit(source, btn) {
+  btn.disabled = true; btn.textContent = '⏳ Excluding…';
+  const fd = new FormData();
+  fd.append('source', source);
+  fd.append('included', 'false');
+  try {
+    const r = await fetch(`/company/${ISIN}/exclude`, {method:'POST', body: fd});
+    const j = await r.json();
+    if (j.ok) {
+      // reflect in the sources/slugs checkbox + row styling
+      const row = document.querySelector(`[data-row-source="${source}"]`);
+      if (row) {
+        row.classList.add('excluded');
+        const cb = row.querySelector('input[type=checkbox]');
+        if (cb) cb.checked = false;
+      }
+      if (j.rebuild && j.rebuild.audit) renderAudit(j.rebuild.audit);
+      else refreshAudit();
+    }
+  } catch (e) { /* noop */ }
+  btn.disabled = false; btn.textContent = 'Excluded';
+}
+
+// ---------- home: filter company table by scraped status ----------
+function filterCompanies(mode, btn) {
+  document.querySelectorAll('#companiesTable tbody tr').forEach(tr => {
+    const s = tr.dataset.scraped;
+    const show =
+      mode === 'all' ||
+      (mode === 'scraped' && s === 'yes') ||
+      (mode === 'not_scraped' && s === 'no');
+    tr.style.display = show ? '' : 'none';
+  });
+  // Simple active-state toggle on filter buttons.
+  if (btn) {
+    btn.parentElement.querySelectorAll('button').forEach(b => b.classList.remove('primary'));
+    btn.classList.add('primary');
+  }
+}
+
+// ---------- open-all-sources helper ----------
+function openAllSources(btn) {
+  // Collect every `↗ Open` link inside a source-row.
+  const links = Array.from(document.querySelectorAll('.source-row a.btn[target="_blank"]'))
+    .map(a => a.href)
+    .filter(Boolean);
+  if (!links.length) {
+    alert('No source pages configured yet — auto-search or paste slugs first.');
+    return;
+  }
+  // Most browsers only allow a single popup per user-gesture. Stagger opens so
+  // the popup blocker sees each one as responding to the original click.
+  links.forEach((url, i) => {
+    setTimeout(() => window.open(url, '_blank', 'noopener'), i * 80);
+  });
+  if (btn) {
+    const orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = `↗ Opened ${links.length}…`;
+    setTimeout(() => { btn.disabled = false; btn.textContent = orig; }, 1200);
+  }
+}
+
+// ---------- auto-search helper ----------
+function autoSearchAll(query) {
+  const name = (query || DISPLAY_NAME || '').trim();
+  if (!name) return;
+  // First 5 chars of the name (letters/digits/spaces), trimmed — short enough
+  // that sharescart's "api-holdings-ltd" matches from "api h" as easily as
+  // unlistedzone's "api-holdings-limited-pharmeasy" does.
+  const q = name.replace(/[^A-Za-z0-9 ]+/g, '').slice(0, 5).trim();
+  if (!q) return;
+  document.querySelectorAll('.source-row .dropdown input[type=search]').forEach(input => {
+    // Skip rows that already have a slug configured.
+    const row = input.closest('.source-row');
+    const current = row ? row.querySelector('.current') : null;
+    const alreadyConfigured = current && !current.classList.contains('empty');
+    if (alreadyConfigured) return;
+    if (input.value && input.value.length > 1) return;   // user already typed
+    input.value = q;
+    input.focus();
+    // Trigger whichever handler is wired up on this input.
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
 }
 
 // ---------- util ----------

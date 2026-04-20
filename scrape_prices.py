@@ -32,14 +32,21 @@ CLI usage:
 import csv
 import json
 import pathlib
+import random
 import re
 import sys
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import requests
 from bs4 import BeautifulSoup
+
+# IST market-hours window used to stamp combined.csv datetimes.
+IST = timezone(timedelta(hours=5, minutes=30))
+_WIN_START_MIN = 10 * 60   # 10:00 IST
+_WIN_END_MIN   = 16 * 60   # 16:00 IST
 
 BASE = pathlib.Path(__file__).parent
 OUT = BASE / "extracted"
@@ -263,23 +270,40 @@ def sharescart(slug: str) -> list:
     if not m:
         raise RuntimeError("sharescart: graph localStorage payload not found")
     graph = json.loads(m.group(1))
-    # User's "biggest dataset" = the key with the most rows.
-    best_values = []
-    for _key, spec in graph.items():
+    # Sharescart serves multiple windows keyed by days (7/30/90/365/1095/1825/…).
+    # Each window covers only its own range, so we MUST merge them all and
+    # dedupe by date — otherwise we silently truncate history to whichever
+    # single window happens to have the most rows.
+    # Walk largest window first so long-history prices win on date collisions.
+    by_date: dict = {}
+    any_data = False
+    def _window_days(k):
+        try:
+            return int(k)
+        except (TypeError, ValueError):
+            return 0
+    for key in sorted(graph.keys(), key=_window_days, reverse=True):
+        spec = graph.get(key) or {}
         try:
             values = spec["datasets"][0]["values"]
         except (KeyError, IndexError, TypeError):
             continue
-        if len(values) > len(best_values):
-            best_values = values
-    if not best_values:
+        for row in values:
+            if not row or len(row) < 2:
+                continue
+            d, p = row[0], row[1]
+            if not d:
+                continue
+            price = _clean_price(p)
+            if price is None:
+                continue
+            any_data = True
+            by_date.setdefault(d, price)
+    if not any_data:
         raise RuntimeError("sharescart: no non-empty dataset")
     out = []
-    for d, p in best_values:
-        price = _clean_price(p)
-        if price is None:
-            continue
-        out.append(_row(_dt_iso(d), price, "sharescart"))
+    for d in sorted(by_date):
+        out.append(_row(_dt_iso(d), by_date[d], "sharescart"))
     return out
 
 
@@ -381,26 +405,148 @@ def _write(path: pathlib.Path, rows: list) -> None:
             w.writerow([dt, price_out, source, tag, note, link])
 
 
-def write_outputs(isin: str, by_source: dict, excluded=()) -> dict:
-    """Write per-source CSVs + combined CSV under extracted/{ISIN}/.
+def _slugify_name(name: str) -> str:
+    """Filesystem-safe snippet from a company display name."""
+    if not name:
+        return ""
+    s = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")
+    return s[:80]
 
-    Per-source files are always written. The combined.csv is built only from
-    sources NOT in `excluded`.
+
+def _combined_filename(isin: str, company_name: str = "") -> str:
+    """`{ISIN}_{Company_Name}_combined.csv` when we have a name, else
+    `{ISIN}_combined.csv`."""
+    slug = _slugify_name(company_name)
+    if slug:
+        return f"{isin}_{slug}_combined.csv"
+    return f"{isin}_combined.csv"
+
+
+def _ist_times_for(rows: list) -> list:
+    """Pick one `YYYY-MM-DDTHH:MM:SS.000Z` stamp per row such that rows on
+    the same calendar date are spread across 10:00–16:00 IST. Rows whose
+    only occurrence on a day get a random time in the same window.
+    `rows` must already be sorted so per-day order is stable.
+    """
+    by_date = defaultdict(list)
+    for i, r in enumerate(rows):
+        by_date[r[0][:10]].append(i)
+
+    out = [None] * len(rows)
+    span = _WIN_END_MIN - _WIN_START_MIN  # 360 min
+    for date_key, idxs in by_date.items():
+        try:
+            y, mo, d = (int(x) for x in date_key.split("-"))
+        except ValueError:
+            # Row datetime malformed — fall back to original string.
+            for ix in idxs:
+                out[ix] = rows[ix][0]
+            continue
+        n = len(idxs)
+        if n == 1:
+            mins_list = [random.randint(_WIN_START_MIN, _WIN_END_MIN)]
+        else:
+            # evenly spaced across the window, inclusive of both ends
+            mins_list = [
+                _WIN_START_MIN + round(i * span / (n - 1)) for i in range(n)
+            ]
+        for ix, mins in zip(idxs, mins_list):
+            ist_dt = datetime(y, mo, d, mins // 60, mins % 60, 0, tzinfo=IST)
+            utc_dt = ist_dt.astimezone(timezone.utc)
+            out[ix] = utc_dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return out
+
+
+def _write_combined(path: pathlib.Path, rows: list) -> None:
+    """Write the merged file in the public schema expected downstream:
+        datetime,price,note,link,category
+    Datetimes are stamped between 10:00–16:00 IST, serialised as UTC ISO.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = sorted(rows, key=lambda r: (r[0], r[2], r[3]))
+    stamps = _ist_times_for(rows)
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["datetime", "price", "note", "link", "category"])
+        for (dt, price, source, tag, note, link), stamp in zip(rows, stamps):
+            try:
+                price_val = float(price)
+                price_out = f"{price_val:.2f}"
+            except (TypeError, ValueError):
+                price_out = price
+            w.writerow([stamp, price_out, note, link, ""])
+
+
+def _sources_dir(folder: pathlib.Path) -> pathlib.Path:
+    """Per-source CSVs live under extracted/{ISIN}/sources/."""
+    return folder / "sources"
+
+
+def _migrate_flat_sources(folder: pathlib.Path) -> None:
+    """Back-compat: if per-source CSVs from an older layout are sitting at the
+    ISIN folder root (e.g. extracted/{ISIN}/altius.csv), move them into the
+    sources/ subfolder so everything stays organized."""
+    sources_dir = _sources_dir(folder)
+    sources_dir.mkdir(parents=True, exist_ok=True)
+    for source in SCRAPERS:
+        old = folder / f"{source}.csv"
+        if old.exists() and old.parent == folder:
+            new = sources_dir / f"{source}.csv"
+            try:
+                old.replace(new)
+            except OSError:
+                pass
+
+
+def _clean_stale_combined(folder: pathlib.Path, keep: pathlib.Path) -> None:
+    """Delete every other combined CSV in the folder, so the ISIN folder has
+    exactly one combined file at any time (even after renames or exclusion
+    toggles that change the filename)."""
+    keep_name = keep.name
+    legacy_names = {"combined.csv"}
+    for p in folder.iterdir():
+        if not p.is_file():
+            continue
+        if p.name == keep_name:
+            continue
+        if p.name in legacy_names or p.name.endswith("_combined.csv"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+def write_outputs(isin: str, by_source: dict, excluded=(), company_name: str = "") -> dict:
+    """Layout under extracted/{ISIN}/:
+        {ISIN}_{Company_Name}_combined.csv   — merged & time-stamped output
+        sources/                             — per-source raw CSVs (debug)
+            planify.csv, unlistedzone.csv, …
+
+    The combined file is always (re)written from scratch in "w" mode, so each
+    call replaces the previous one. Any stale `*_combined.csv` from earlier
+    runs (e.g. under a different company name) is removed.
     """
     folder = OUT / isin
     folder.mkdir(parents=True, exist_ok=True)
+    _migrate_flat_sources(folder)
+    sources_dir = _sources_dir(folder)
+    sources_dir.mkdir(parents=True, exist_ok=True)
     excluded = set(excluded or ())
     combined = []
     files = {}
     for source, rows in by_source.items():
-        f = folder / f"{source}.csv"
+        f = sources_dir / f"{source}.csv"
         _write(f, rows)
         files[source] = str(f)
         if source not in excluded:
             combined += rows
-    combined_path = folder / "combined.csv"
-    _write(combined_path, combined)
+    combined_name = _combined_filename(isin, company_name)
+    combined_path = folder / combined_name
+    _write_combined(combined_path, combined)
+    _clean_stale_combined(folder, combined_path)
     files["combined"] = str(combined_path)
+    files["combined_name"] = combined_name
+    files["sources_dir"] = str(sources_dir)
     print(
         f"{isin}: combined={len(combined)} rows "
         f"(excluded: {sorted(excluded) or 'none'}) -> {combined_path}"
@@ -408,22 +554,116 @@ def write_outputs(isin: str, by_source: dict, excluded=()) -> dict:
     return files
 
 
-def rebuild_combined(isin: str, excluded=()) -> dict:
-    """Rebuild combined.csv from existing per-source CSVs, applying exclusions.
+def _source_csv_path(folder: pathlib.Path, source: str) -> pathlib.Path | None:
+    """Return the per-source CSV path if it exists under either the new
+    sources/ layout or the legacy flat layout. None if neither."""
+    new = _sources_dir(folder) / f"{source}.csv"
+    if new.exists():
+        return new
+    old = folder / f"{source}.csv"
+    if old.exists():
+        return old
+    return None
 
-    Useful when the user toggles include/exclude on a source without
-    re-running the network scrapers.
+
+def audit_sources(isin: str) -> dict:
+    """Cross-compare per-source CSVs for one ISIN and flag any source whose
+    prices look wildly out of line with the rest. Pure arithmetic — no
+    hard-coded blacklists; the judgement is made *for this ISIN only*.
+
+    A source is flagged SUSPECT when on the dates it shares with other
+    sources, its price ratio vs. the cross-source median is >1.5 or <0.67
+    on more than 40% of those days. Needs ≥2 sources overlapping on ≥5
+    common days to produce any flags.
+    """
+    folder = OUT / isin
+    if not folder.exists():
+        return {"isin": isin, "sources": {}, "suspects": []}
+    _migrate_flat_sources(folder)
+    per_source = {}
+    for source in SCRAPERS:
+        f = _source_csv_path(folder, source)
+        if f is None:
+            continue
+        rows = {}
+        with f.open() as fp:
+            reader = csv.reader(fp, delimiter=";")
+            next(reader, None)
+            for r in reader:
+                if len(r) < 2:
+                    continue
+                try:
+                    rows[r[0][:10]] = float(r[1])
+                except ValueError:
+                    continue
+        if rows:
+            per_source[source] = rows
+    # Build per-date median across all sources.
+    from collections import defaultdict
+    per_date = defaultdict(dict)
+    for src, rows in per_source.items():
+        for d, p in rows.items():
+            per_date[d][src] = p
+    report = {}
+    for src in per_source:
+        deviated = 0
+        shared = 0
+        ratios = []
+        for d, m in per_date.items():
+            if src not in m or len(m) < 2:
+                continue
+            others = [v for s, v in m.items() if s != src]
+            if not others:
+                continue
+            others_sorted = sorted(others)
+            med = others_sorted[len(others_sorted) // 2]
+            if med <= 0:
+                continue
+            shared += 1
+            ratio = m[src] / med
+            ratios.append(ratio)
+            if ratio > 1.5 or ratio < 0.67:
+                deviated += 1
+        if shared == 0:
+            report[src] = {
+                "shared_days": 0,
+                "deviated_days": 0,
+                "deviation_pct": 0.0,
+                "median_ratio": None,
+                "suspect": False,
+            }
+            continue
+        pct = 100.0 * deviated / shared
+        ratios.sort()
+        median_ratio = ratios[len(ratios) // 2]
+        suspect = shared >= 5 and pct > 40.0
+        report[src] = {
+            "shared_days": shared,
+            "deviated_days": deviated,
+            "deviation_pct": round(pct, 1),
+            "median_ratio": round(median_ratio, 3),
+            "suspect": suspect,
+        }
+    suspects = [s for s, r in report.items() if r["suspect"]]
+    return {"isin": isin, "sources": report, "suspects": suspects}
+
+
+def rebuild_combined(isin: str, excluded=(), company_name: str = "") -> dict:
+    """Rebuild the combined CSV from existing per-source CSVs, applying
+    exclusions. Useful when the user toggles include/exclude on a source
+    without re-running the network scrapers.
     """
     folder = OUT / isin
     if not folder.exists():
         raise FileNotFoundError(f"No extracted folder for {isin}")
+    _migrate_flat_sources(folder)
     excluded = set(excluded or ())
     combined = []
     used = []
     skipped = []
     for source in SCRAPERS:
-        f = folder / f"{source}.csv"
-        if not f.exists():
+        f = _source_csv_path(folder, source)
+        if f is None:
             continue
         if source in excluded:
             skipped.append(source)
@@ -442,11 +682,14 @@ def rebuild_combined(isin: str, excluded=()) -> dict:
                     continue
                 combined.append((dt, price_v, src, tag, note, link))
         used.append(source)
-    combined_path = folder / "combined.csv"
-    _write(combined_path, combined)
+    combined_name = _combined_filename(isin, company_name)
+    combined_path = folder / combined_name
+    _write_combined(combined_path, combined)
+    _clean_stale_combined(folder, combined_path)
     return {
         "isin": isin,
         "combined": str(combined_path),
+        "combined_name": combined_name,
         "rows": len(combined),
         "included": used,
         "excluded": sorted(excluded),
@@ -464,7 +707,7 @@ SCRAPERS = {
 }
 
 
-def scrape(isin: str, sources: dict, excluded=()) -> dict:
+def scrape(isin: str, sources: dict, excluded=(), company_name: str = "") -> dict:
     """Scrape all configured sources for one company. Returns a summary.
 
     `excluded`: collection of source names to omit from combined.csv (per-source
@@ -500,7 +743,7 @@ def scrape(isin: str, sources: dict, excluded=()) -> dict:
                 except Exception as e:
                     counts[tag] = f"FAIL: {e}"
                     print(f"  {tag}[{slug}] failed: {e}", file=sys.stderr)
-    files = write_outputs(isin, by_source, excluded=excluded)
+    files = write_outputs(isin, by_source, excluded=excluded, company_name=company_name)
     total = sum(len(v) for v in by_source.values())
     excluded_set = set(excluded or ())
     combined_total = sum(
