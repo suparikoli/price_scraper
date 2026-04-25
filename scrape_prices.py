@@ -413,6 +413,79 @@ def _slugify_name(name: str) -> str:
     return s[:80]
 
 
+def _extracted_folder(isin: str, company_name: str = "") -> pathlib.Path:
+    """Canonical write path for an ISIN: `extracted/{ISIN}_{Company_Name}/`.
+    Falls back to `extracted/{ISIN}/` if no company_name is provided."""
+    slug = _slugify_name(company_name)
+    return OUT / (f"{isin}_{slug}" if slug else isin)
+
+
+def _find_extracted_folder(isin: str) -> pathlib.Path | None:
+    """Locate the on-disk folder for an ISIN regardless of naming convention.
+    Returns the most recently modified match among:
+      - extracted/{ISIN}_{Any_Name}
+      - extracted/{ISIN}              (legacy pre-rename)
+    None if nothing found."""
+    if not OUT.exists():
+        return None
+    candidates = []
+    for p in OUT.iterdir():
+        if not p.is_dir():
+            continue
+        if p.name == isin or p.name.startswith(f"{isin}_"):
+            candidates.append(p)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _migrate_extracted_folder(isin: str, company_name: str) -> pathlib.Path:
+    """Ensure the canonical `{ISIN}_{Name}/` folder exists. If a legacy
+    folder (plain `{ISIN}/` or an older `{ISIN}_{OtherName}/`) is on disk,
+    rename it to the canonical name so no data is lost. Returns the
+    canonical path."""
+    target = _extracted_folder(isin, company_name)
+    # If nothing exists, caller creates the directory.
+    existing = _find_extracted_folder(isin)
+    if existing is None or existing.resolve() == target.resolve():
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    if target.exists():
+        # Both exist — merge: move contents of existing → target, then drop existing.
+        for child in existing.iterdir():
+            dest = target / child.name
+            try:
+                if dest.exists():
+                    # Prefer the newer version (higher mtime).
+                    try:
+                        if child.stat().st_mtime > dest.stat().st_mtime:
+                            if dest.is_dir():
+                                import shutil as _sh; _sh.rmtree(dest)
+                            else:
+                                dest.unlink()
+                            child.replace(dest)
+                        else:
+                            if child.is_dir():
+                                import shutil as _sh; _sh.rmtree(child)
+                            else:
+                                child.unlink()
+                    except OSError:
+                        pass
+                else:
+                    child.replace(dest)
+            except OSError:
+                pass
+        try:
+            existing.rmdir()
+        except OSError:
+            pass
+    else:
+        existing.rename(target)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def _combined_filename(isin: str, company_name: str = "") -> str:
     """`{ISIN}_{Company_Name}_combined.csv` when we have a name, else
     `{ISIN}_combined.csv`."""
@@ -420,6 +493,418 @@ def _combined_filename(isin: str, company_name: str = "") -> str:
     if slug:
         return f"{isin}_{slug}_combined.csv"
     return f"{isin}_combined.csv"
+
+
+def _main_realtime_filename(isin: str, company_name: str = "") -> str:
+    """`{ISIN}_{Company_Name}_main_realtime.csv` when we have a name, else
+    `{ISIN}_main_realtime.csv`."""
+    slug = _slugify_name(company_name)
+    if slug:
+        return f"{isin}_{slug}_main_realtime.csv"
+    return f"{isin}_main_realtime.csv"
+
+
+# --- main_realtime outlier defenses ---
+# Per-day: when a day has ≥3 sources, drop any whose price deviates more than
+# this fraction from the cross-source median, then take the median of what's
+# left. Kills single-source glitches (e.g. planify showing 600 while 3 other
+# sources agree on ~60).
+_REALTIME_DAY_OUTLIER_FRAC = 0.40      # 40% away from intra-day median → drop
+
+# Timeline step guard: only trigger when (a) today's jump is large AND
+# (b) today has <min_cur sources AND (c) the baseline we'd anchor to came
+# from a multi-source day within the last max_age days. This prevents the
+# guard from locking onto a long stretch of single-source placeholder data
+# (e.g. unlistedzone showing 2.0 as a default before the IPO listing).
+_REALTIME_STEP_RATIO_MAX = 2.0         # >2× (or <0.5×) step → suspect
+_REALTIME_STEP_MIN_SOURCES_CUR = 2     # apply guard only if today has <2 sources
+_REALTIME_STEP_MIN_SOURCES_BASELINE = 2  # baseline must have had ≥2 sources
+_REALTIME_STEP_MAX_BASELINE_AGE = 14   # forget baseline older than 14 days
+
+# Rolling-window outlier check: after the step guard, walk the series once
+# more with a sliding window of the last N output prices. If today is >ratio×
+# the rolling median AND today's source count is below the min, carry forward
+# the rolling median. Catches mid-series single-source glitches where we
+# never had a fresh multi-source baseline (e.g. a long single-source stretch
+# with a one-day spike).
+_REALTIME_ROLL_WINDOW = 7              # days of recent output to compare against
+_REALTIME_ROLL_RATIO_MAX = 3.0         # >3× above/below rolling median → suspect
+_REALTIME_ROLL_MIN_WINDOW = 3          # need ≥3 recent values to trust the window
+_REALTIME_ROLL_MIN_SOURCES_CUR = 2     # only clip when today has <2 sources
+
+# Freshness penalty: a source that reports the exact same price for more
+# than this many consecutive data points is treated as "stale" (likely a
+# frozen/default value rather than a current quote). When picking the median
+# row on a given day, we swap a stale winner for the nearest non-stale
+# neighbour, preferring the lower-priced side to avoid upward bias.
+# Example: incredmoney reporting Hero FinCorp at 1965 every single day from
+# December through January while unlistedzone / altius actually move gets
+# flagged and deprioritised.
+_REALTIME_STALE_RUN_DAYS = 7
+
+# Swap cap: if the "fresh" candidate disagrees with the stale winner by more
+# than this ratio, DON'T swap — the fresh value is likely itself a one-off
+# glitch (e.g. wwipl briefly reports InCred at 10.0 while altius has been
+# holding steady at 82.0). A stable stale value beats a wildly disagreeing
+# fresh one. Hero FinCorp's 1965 vs 1950 (ratio ≈1.01) still swaps cleanly.
+_REALTIME_STALE_SWAP_MAX_RATIO = 3.0
+
+
+def _pick_median_row(rows: list) -> tuple:
+    """Upper-middle row of a list sorted by price ascending."""
+    rows = sorted(rows, key=lambda r: float(r[1]))
+    return rows[len(rows) // 2]
+
+
+# Auto-exclude a source whose prices deviate > this ratio from the cross-source
+# median on more than this fraction of shared days — but only if we have at
+# least this many shared days to judge from. Same thresholds as audit_sources().
+_REALTIME_SUSPECT_RATIO_HIGH = 1.5
+_REALTIME_SUSPECT_RATIO_LOW = 0.67
+_REALTIME_SUSPECT_PCT = 0.40           # >40% of shared days off
+_REALTIME_SUSPECT_MIN_DAYS = 5
+
+
+def _suspect_sources(rows: list) -> set:
+    """Return the set of sources whose prices are systematically off vs the
+    cross-source consensus. Uses the same rule as audit_sources(): on days
+    the source shares with other sources, flag it suspect when it deviates
+    >1.5× or <0.67× from the cross-source median on >40% of those days
+    (needs ≥5 shared days). Pin rows (tag set) are ignored."""
+    per_source = defaultdict(dict)  # source -> date -> price
+    for r in rows:
+        if r[3]:
+            continue
+        try:
+            p = float(r[1])
+        except (TypeError, ValueError):
+            continue
+        d = r[0][:10]
+        per_source[r[2]].setdefault(d, p)
+    per_date = defaultdict(dict)
+    for src, dps in per_source.items():
+        for d, p in dps.items():
+            per_date[d][src] = p
+    suspects = set()
+    for src in per_source:
+        deviated = 0
+        shared = 0
+        ratios = []
+        for d, m in per_date.items():
+            if src not in m or len(m) < 2:
+                continue
+            others = [v for s, v in m.items() if s != src]
+            if not others:
+                continue
+            others_sorted = sorted(others)
+            med = others_sorted[len(others_sorted) // 2]
+            if med <= 0:
+                continue
+            shared += 1
+            ratio = m[src] / med
+            ratios.append(ratio)
+            if ratio > _REALTIME_SUSPECT_RATIO_HIGH or ratio < _REALTIME_SUSPECT_RATIO_LOW:
+                deviated += 1
+        if shared < _REALTIME_SUSPECT_MIN_DAYS:
+            continue
+        ratios.sort()
+        median_ratio = ratios[len(ratios) // 2]
+        # Require BOTH many deviations AND a median ratio that's itself out
+        # of bounds — otherwise a source that's only occasionally off (e.g.
+        # altius disagreeing with a single stale-at-169 source) is wrongly
+        # flagged. Example: InCred altius with median_ratio=0.70 (slightly
+        # below consensus) stays, PharmEasy altius with median_ratio≈14×
+        # gets auto-excluded.
+        if (
+            deviated / shared > _REALTIME_SUSPECT_PCT
+            and (median_ratio > _REALTIME_SUSPECT_RATIO_HIGH
+                 or median_ratio < _REALTIME_SUSPECT_RATIO_LOW)
+        ):
+            suspects.add(src)
+    return suspects
+
+
+def _compute_staleness(rows: list, run_threshold: int = _REALTIME_STALE_RUN_DAYS) -> set:
+    """Return the set of (source, date) keys that are stale — i.e. part of
+    a consecutive-same-price run longer than `run_threshold` days for the
+    same source.
+
+    We dedupe per (source, date) first (keeping the first price per day),
+    then sweep chronologically counting consecutive days with the exact
+    same price. Any day whose running count exceeds `run_threshold` is
+    flagged stale.
+    """
+    per_source = defaultdict(list)
+    for r in rows:
+        if r[3]:                      # skip pin rows
+            continue
+        per_source[r[2]].append(r)
+    stale = set()
+    for src, src_rows in per_source.items():
+        src_rows.sort(key=lambda r: r[0])
+        seen_dates = set()
+        deduped = []
+        for r in src_rows:
+            d = r[0][:10]
+            if d in seen_dates:
+                continue
+            seen_dates.add(d)
+            deduped.append(r)
+        run_len = 0
+        last_price = None
+        for r in deduped:
+            try:
+                p = float(r[1])
+            except (TypeError, ValueError):
+                run_len = 0
+                last_price = None
+                continue
+            if last_price is not None and p == last_price:
+                run_len += 1
+            else:
+                run_len = 1
+            last_price = p
+            if run_len > run_threshold:
+                stale.add((src, r[0][:10]))
+    return stale
+
+
+def _recent_fresh_anchor(
+    rows: list, stale_keys: set, cutoff_date: str, window_days: int = 30
+) -> float | None:
+    """Median of every non-stale per-source price in the `window_days`
+    ending at `cutoff_date`. Used as a tiebreaker when every survivor on a
+    given day is stale — we pick whichever stale survivor sits closer to
+    the most recent fresh data, even if that fresh data came from a
+    different source on a different day.
+
+    Example: Hindustan Engg's recent days have incredmoney stuck at 1699
+    and unlistedzone stuck at 1050; wwipl occasionally reports 960 and
+    planify 1086. The anchor (median of {960, 1086, …}) ≈ 1020, so
+    unlistedzone (1050) wins over incredmoney (1699).
+    """
+    try:
+        y, mo, d = (int(x) for x in cutoff_date.split("-"))
+    except (ValueError, TypeError):
+        return None
+    from datetime import date as _date, timedelta as _td
+    end = _date(y, mo, d)
+    start = (end - _td(days=window_days)).isoformat()
+    fresh: list[float] = []
+    for r in rows:
+        if r[3]:
+            continue
+        dk = r[0][:10]
+        if dk < start or dk > cutoff_date:
+            continue
+        if (r[2], dk) in stale_keys:
+            continue
+        try:
+            fresh.append(float(r[1]))
+        except (TypeError, ValueError):
+            continue
+    if not fresh:
+        return None
+    fresh.sort()
+    return fresh[len(fresh) // 2]
+
+
+def _pick_freshness_aware_median(rows: list, stale_keys: set) -> tuple:
+    """Upper-middle by price; if that row is from a stale source, swap to
+    the nearest non-stale neighbour (preferring the lower-priced side
+    first, then the higher) — but only when the candidate's price is
+    within _REALTIME_STALE_SWAP_MAX_RATIO of the stale row. A fresh
+    candidate that disagrees 8× with the stale winner is more likely a
+    glitch than a correction. Falls back to the upper-middle row when
+    nothing else qualifies."""
+    rows_sorted = sorted(rows, key=lambda r: float(r[1]))
+    n = len(rows_sorted)
+    idx = n // 2
+    chosen = rows_sorted[idx]
+    if (chosen[2], chosen[0][:10]) not in stale_keys:
+        return chosen
+    stale_price = float(chosen[1])
+    for d in range(1, n):
+        for j in (idx - d, idx + d):
+            if 0 <= j < n:
+                cand = rows_sorted[j]
+                if (cand[2], cand[0][:10]) in stale_keys:
+                    continue
+                cand_price = float(cand[1])
+                if stale_price > 0:
+                    r = cand_price / stale_price
+                    if r > _REALTIME_STALE_SWAP_MAX_RATIO or r < 1.0 / _REALTIME_STALE_SWAP_MAX_RATIO:
+                        # Fresh candidate disagrees too wildly — likely a glitch.
+                        continue
+                return cand
+    return chosen
+
+
+def _median_per_day(rows: list) -> list:
+    """Collapse multi-source, multi-row-per-day input into one row per day
+    using robust statistics.
+
+    Step 1 — grouping
+        Per (date, source) keep the first price row. Altius pin rows (tag
+        non-empty) are dropped since they duplicate the price row.
+
+    Step 2 — per-day outlier rejection
+        For each date: if ≥3 sources reported, compute the naive median,
+        then drop any source whose price deviates >_REALTIME_DAY_OUTLIER_FRAC
+        from that median. Recompute median over the survivors. When <3
+        sources reported, skip the filter (too little signal to distinguish
+        outliers).
+
+    Step 3 — timeline step guard
+        Walk the per-day timeline chronologically. If a day's price differs
+        from the previous day's FINAL price by more than _REALTIME_STEP_RATIO_MAX
+        (up or down) AND that day had fewer than _REALTIME_STEP_MIN_SOURCES
+        surviving sources, carry forward the previous day's price/row instead
+        of emitting the jump. This catches single-source glitches on days
+        where no other source had data to cross-check.
+
+    Returns a new list of row tuples suitable for _write_combined().
+    """
+    # Step 0a: auto-exclude systematically-wrong sources. When a source
+    # deviates > ±50% from the cross-source consensus on most shared days
+    # (e.g. altius reporting PharmEasy at ~180 while every other source
+    # shows ~13), drop it entirely before processing.
+    suspect_srcs = _suspect_sources(rows)
+    if suspect_srcs:
+        rows = [r for r in rows if r[2] not in suspect_srcs]
+
+    # Step 0b: detect stale (frozen) source/day pairs.
+    stale_keys = _compute_staleness(rows)
+
+    # Step 1: group
+    by_date_src = {}  # (date, source) -> first price row
+    for r in rows:
+        if r[3]:
+            continue
+        date_key = r[0][:10]
+        key = (date_key, r[2])
+        if key not in by_date_src:
+            by_date_src[key] = r
+    by_date = defaultdict(list)
+    for (date_key, _src), r in by_date_src.items():
+        by_date[date_key].append(r)
+
+    # Step 2: per-day outlier rejection + freshness-aware median.
+    # We track FRESH survivors (not just total) — days where every surviving
+    # source is stale are effectively single-source data and should trigger
+    # the step guard, even if N sources reported. Example: Hindustan Engg
+    # with incredmoney stuck at 1699 and unlistedzone stuck at 1050 (both
+    # stale): upper-middle would oscillate to 1699; instead we tiebreak
+    # using a recent-fresh anchor across all sources so the closer stale
+    # survivor wins, and the step guard can still carry forward where
+    # appropriate.
+    per_day = []  # list of (date_key, chosen_row, fresh_survivor_count)
+    for date_key in sorted(by_date):
+        group = by_date[date_key]
+        survivors = group
+        if len(group) >= 3:
+            prices = sorted(float(r[1]) for r in group)
+            naive_med = prices[len(prices) // 2]
+            if naive_med > 0:
+                filtered = [
+                    r for r in group
+                    if abs(float(r[1]) - naive_med) / naive_med <= _REALTIME_DAY_OUTLIER_FRAC
+                ]
+                if filtered:
+                    survivors = filtered
+        fresh = sum(1 for r in survivors if (r[2], r[0][:10]) not in stale_keys)
+        # All-stale tiebreak: pick the survivor closest to the recent
+        # fresh anchor across all sources.
+        if fresh == 0 and len(survivors) >= 2:
+            anchor = _recent_fresh_anchor(rows, stale_keys, date_key)
+            if anchor is not None and anchor > 0:
+                chosen = min(survivors, key=lambda r: abs(float(r[1]) - anchor))
+                per_day.append((date_key, chosen, fresh))
+                continue
+        chosen = _pick_freshness_aware_median(survivors, stale_keys)
+        per_day.append((date_key, chosen, fresh))
+
+    # Step 3: timeline step guard
+    # Maintain a *trusted baseline* — the most recent day that had ≥
+    # _REALTIME_STEP_MIN_SOURCES_BASELINE sources. We only carry forward
+    # from a trusted baseline; if we have no baseline yet (series starts
+    # with single-source data) or the baseline is stale, today's value
+    # passes through unchanged.
+    from datetime import date as _date
+    def _parse(dk):
+        y, mo, d = (int(x) for x in dk.split("-"))
+        return _date(y, mo, d)
+
+    staged = []  # [(row, n_survivors), ...] after step guard
+    baseline_price = None
+    baseline_row = None
+    baseline_date = None
+    for date_key, row, n_survivors in per_day:
+        price = float(row[1])
+        today = _parse(date_key)
+        use_baseline = False
+        if (
+            baseline_price is not None
+            and baseline_price > 0
+            and n_survivors < _REALTIME_STEP_MIN_SOURCES_CUR
+            and (today - baseline_date).days <= _REALTIME_STEP_MAX_BASELINE_AGE
+        ):
+            ratio = price / baseline_price
+            if ratio > _REALTIME_STEP_RATIO_MAX or ratio < 1.0 / _REALTIME_STEP_RATIO_MAX:
+                use_baseline = True
+        if use_baseline:
+            dt_prefix = row[0][:10]
+            dt_suffix = baseline_row[0][10:] or " 00:00:00"
+            carried = (
+                f"{dt_prefix}{dt_suffix}",
+                baseline_row[1], baseline_row[2], baseline_row[3],
+                (baseline_row[4] + " [carried forward]").strip(),
+                baseline_row[5],
+            )
+            staged.append((carried, n_survivors))
+            continue
+        staged.append((row, n_survivors))
+        if n_survivors >= _REALTIME_STEP_MIN_SOURCES_BASELINE:
+            baseline_price = price
+            baseline_row = row
+            baseline_date = today
+
+    # Step 4: rolling-window outlier clip. Only trust the window if it
+    # contains enough multi-source days — otherwise a long single-source
+    # placeholder stretch (e.g. a pre-IPO "2.0" default) would poison the
+    # rolling median and clip real prices back to the placeholder.
+    out = []
+    out_meta = []  # parallel list of n_survivors for every committed row
+    for row, n_survivors in staged:
+        price = float(row[1])
+        start = max(0, len(out) - _REALTIME_ROLL_WINDOW)
+        window_prices = [float(out[j][1]) for j in range(start, len(out))]
+        trusted_days = sum(
+            1 for j in range(start, len(out_meta))
+            if out_meta[j] >= _REALTIME_STEP_MIN_SOURCES_BASELINE
+        )
+        should_clip = (
+            len(window_prices) >= _REALTIME_ROLL_MIN_WINDOW
+            and trusted_days >= _REALTIME_ROLL_MIN_WINDOW  # window must be trustworthy
+            and n_survivors < _REALTIME_ROLL_MIN_SOURCES_CUR
+        )
+        if should_clip:
+            wp = sorted(window_prices)
+            roll_med = wp[len(wp) // 2]
+            if roll_med > 0:
+                ratio = price / roll_med
+                if ratio > _REALTIME_ROLL_RATIO_MAX or ratio < 1.0 / _REALTIME_ROLL_RATIO_MAX:
+                    smoothed = (
+                        row[0], roll_med, row[2], row[3],
+                        (row[4] + " [rolling-smoothed]").strip(),
+                        row[5],
+                    )
+                    out.append(smoothed)
+                    out_meta.append(n_survivors)
+                    continue
+        out.append(row)
+        out_meta.append(n_survivors)
+    return out
 
 
 def _ist_times_for(rows: list) -> list:
@@ -498,18 +983,22 @@ def _migrate_flat_sources(folder: pathlib.Path) -> None:
                 pass
 
 
-def _clean_stale_combined(folder: pathlib.Path, keep: pathlib.Path) -> None:
-    """Delete every other combined CSV in the folder, so the ISIN folder has
-    exactly one combined file at any time (even after renames or exclusion
-    toggles that change the filename)."""
-    keep_name = keep.name
+def _clean_stale_combined(folder: pathlib.Path, *keeps: pathlib.Path) -> None:
+    """Delete every other combined / main_realtime CSV in the folder, so the
+    ISIN folder has exactly one of each at any time (even after renames or
+    exclusion toggles that change the filename)."""
+    keep_names = {k.name for k in keeps}
     legacy_names = {"combined.csv"}
     for p in folder.iterdir():
         if not p.is_file():
             continue
-        if p.name == keep_name:
+        if p.name in keep_names:
             continue
-        if p.name in legacy_names or p.name.endswith("_combined.csv"):
+        if (
+            p.name in legacy_names
+            or p.name.endswith("_combined.csv")
+            or p.name.endswith("_main_realtime.csv")
+        ):
             try:
                 p.unlink()
             except OSError:
@@ -526,8 +1015,7 @@ def write_outputs(isin: str, by_source: dict, excluded=(), company_name: str = "
     call replaces the previous one. Any stale `*_combined.csv` from earlier
     runs (e.g. under a different company name) is removed.
     """
-    folder = OUT / isin
-    folder.mkdir(parents=True, exist_ok=True)
+    folder = _migrate_extracted_folder(isin, company_name)
     _migrate_flat_sources(folder)
     sources_dir = _sources_dir(folder)
     sources_dir.mkdir(parents=True, exist_ok=True)
@@ -543,12 +1031,20 @@ def write_outputs(isin: str, by_source: dict, excluded=(), company_name: str = "
     combined_name = _combined_filename(isin, company_name)
     combined_path = folder / combined_name
     _write_combined(combined_path, combined)
-    _clean_stale_combined(folder, combined_path)
+    realtime_name = _main_realtime_filename(isin, company_name)
+    realtime_path = folder / realtime_name
+    realtime_rows = _median_per_day(combined)
+    _write_combined(realtime_path, realtime_rows)
+    _clean_stale_combined(folder, combined_path, realtime_path)
     files["combined"] = str(combined_path)
     files["combined_name"] = combined_name
+    files["realtime"] = str(realtime_path)
+    files["realtime_name"] = realtime_name
+    files["realtime_rows"] = len(realtime_rows)
     files["sources_dir"] = str(sources_dir)
     print(
-        f"{isin}: combined={len(combined)} rows "
+        f"{isin}: combined={len(combined)} rows, "
+        f"realtime={len(realtime_rows)} rows "
         f"(excluded: {sorted(excluded) or 'none'}) -> {combined_path}"
     )
     return files
@@ -576,8 +1072,8 @@ def audit_sources(isin: str) -> dict:
     on more than 40% of those days. Needs ≥2 sources overlapping on ≥5
     common days to produce any flags.
     """
-    folder = OUT / isin
-    if not folder.exists():
+    folder = _find_extracted_folder(isin)
+    if folder is None or not folder.exists():
         return {"isin": isin, "sources": {}, "suspects": []}
     _migrate_flat_sources(folder)
     per_source = {}
@@ -653,9 +1149,13 @@ def rebuild_combined(isin: str, excluded=(), company_name: str = "") -> dict:
     exclusions. Useful when the user toggles include/exclude on a source
     without re-running the network scrapers.
     """
-    folder = OUT / isin
-    if not folder.exists():
+    folder = _find_extracted_folder(isin)
+    if folder is None or not folder.exists():
         raise FileNotFoundError(f"No extracted folder for {isin}")
+    # If the folder exists under the legacy plain-ISIN path or an older
+    # name, move it to the canonical {ISIN}_{Name}/ layout before we
+    # rewrite combined + main_realtime inside.
+    folder = _migrate_extracted_folder(isin, company_name)
     _migrate_flat_sources(folder)
     excluded = set(excluded or ())
     combined = []
@@ -685,11 +1185,18 @@ def rebuild_combined(isin: str, excluded=(), company_name: str = "") -> dict:
     combined_name = _combined_filename(isin, company_name)
     combined_path = folder / combined_name
     _write_combined(combined_path, combined)
-    _clean_stale_combined(folder, combined_path)
+    realtime_name = _main_realtime_filename(isin, company_name)
+    realtime_path = folder / realtime_name
+    realtime_rows = _median_per_day(combined)
+    _write_combined(realtime_path, realtime_rows)
+    _clean_stale_combined(folder, combined_path, realtime_path)
     return {
         "isin": isin,
         "combined": str(combined_path),
         "combined_name": combined_name,
+        "realtime": str(realtime_path),
+        "realtime_name": realtime_name,
+        "realtime_rows": len(realtime_rows),
         "rows": len(combined),
         "included": used,
         "excluded": sorted(excluded),
@@ -705,6 +1212,138 @@ SCRAPERS = {
     "altius": altius,
     "altmoneyvault": altmoneyvault,
 }
+
+
+def _load_existing_source_rows(folder: pathlib.Path, source: str) -> tuple[list, set]:
+    """Return (rows, date_set) from extracted/{ISIN}/sources/{source}.csv.
+    Used by scrape_incremental to skip dates we already have on disk."""
+    path = _source_csv_path(folder, source)
+    if path is None:
+        return [], set()
+    rows: list = []
+    dates: set = set()
+    try:
+        with path.open() as fp:
+            reader = csv.reader(fp, delimiter=";")
+            next(reader, None)
+            for r in reader:
+                if len(r) != 6:
+                    continue
+                try:
+                    price = float(r[1])
+                except ValueError:
+                    continue
+                rows.append((r[0], price, r[2], r[3], r[4], r[5]))
+                dates.add(r[0][:10])
+    except OSError:
+        pass
+    return rows, dates
+
+
+def scrape_incremental(
+    isin: str, sources: dict, excluded=(), company_name: str = ""
+) -> dict:
+    """Incremental scrape: hit each source, keep only rows whose calendar
+    date isn't already in the existing per-source CSV, append them, then
+    rebuild combined + main_realtime from the merged per-source data.
+
+    Existing data is preserved unchanged — retroactive upstream corrections
+    are ignored. Used by the daily scheduler (09:30 IST); the manual
+    'Run all' / 'Scrape ALL' buttons use `scrape()` which does a full
+    replace. Returns a summary compatible with `scrape()`.
+    """
+    folder = _migrate_extracted_folder(isin, company_name)
+    _migrate_flat_sources(folder)
+    sources_dir = _sources_dir(folder)
+    sources_dir.mkdir(parents=True, exist_ok=True)
+
+    # First, read what we already have on disk (per source)
+    existing_by_source: dict = {}
+    for src in sources:
+        existing_by_source[src] = _load_existing_source_rows(folder, src)
+
+    counts: dict = {}
+    merged_by_source: dict = {}
+    jobs: dict = {}
+    for tag, raw in sources.items():
+        if not raw:
+            continue
+        fn = SCRAPERS.get(tag)
+        if not fn:
+            counts[tag] = "unknown source"
+            merged_by_source[tag] = existing_by_source.get(tag, ([], set()))[0]
+            continue
+        jobs[(tag, slug_from_value(tag, raw))] = fn
+
+    if jobs:
+        with ThreadPoolExecutor(max_workers=min(len(jobs), 7)) as ex:
+            futures = {
+                ex.submit(fn, slug): (tag, slug)
+                for (tag, slug), fn in jobs.items()
+            }
+            for fut in as_completed(futures):
+                tag, slug = futures[fut]
+                existing_rows, existing_dates = existing_by_source.get(tag, ([], set()))
+                try:
+                    fresh_rows = fut.result()
+                except Exception as e:
+                    counts[tag] = f"FAIL: {e}"
+                    merged_by_source[tag] = existing_rows  # keep what we had
+                    print(f"  {tag}[{slug}] failed: {e} (kept {len(existing_rows)} existing rows)", file=sys.stderr)
+                    continue
+                # Keep only rows on dates we don't already have
+                new_rows = [r for r in fresh_rows if r[0][:10] not in existing_dates]
+                merged = existing_rows + new_rows
+                merged_by_source[tag] = merged
+                counts[tag] = f"+{len(new_rows)} new (kept {len(existing_rows)})"
+
+    # Write back every per-source CSV (sorted, deduped by _write)
+    excluded = set(excluded or ())
+    combined: list = []
+    files: dict = {}
+    for source, rows in merged_by_source.items():
+        f = sources_dir / f"{source}.csv"
+        _write(f, rows)
+        files[source] = str(f)
+        if source not in excluded:
+            combined += rows
+    combined_name = _combined_filename(isin, company_name)
+    combined_path = folder / combined_name
+    _write_combined(combined_path, combined)
+    realtime_name = _main_realtime_filename(isin, company_name)
+    realtime_path = folder / realtime_name
+    realtime_rows = _median_per_day(combined)
+    _write_combined(realtime_path, realtime_rows)
+    _clean_stale_combined(folder, combined_path, realtime_path)
+
+    files["combined"] = str(combined_path)
+    files["combined_name"] = combined_name
+    files["realtime"] = str(realtime_path)
+    files["realtime_name"] = realtime_name
+    files["realtime_rows"] = len(realtime_rows)
+    files["sources_dir"] = str(sources_dir)
+
+    total = sum(len(v) for v in merged_by_source.values())
+    combined_total = sum(
+        len(v) for k, v in merged_by_source.items() if k not in excluded
+    )
+    for tag, c in counts.items():
+        marker = "  (excluded)" if tag in excluded else ""
+        print(f"    {tag}: {c}{marker}")
+    print(
+        f"{isin} (incremental): combined={len(combined)} rows, "
+        f"realtime={len(realtime_rows)} rows -> {combined_path}"
+    )
+    return {
+        "isin": isin,
+        "total": total,
+        "combined_total": combined_total,
+        "counts": counts,
+        "excluded": sorted(excluded),
+        "files": files,
+        "combined": files.get("combined"),
+        "mode": "incremental",
+    }
 
 
 def scrape(isin: str, sources: dict, excluded=(), company_name: str = "") -> dict:

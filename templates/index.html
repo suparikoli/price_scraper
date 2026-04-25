@@ -87,7 +87,13 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
 <header>
   <h1>Unlisted Scraper Admin</h1>
   <span class="crumbs">
-    <a href="{{ url_for('home') }}">Home</a>
+    <a href="{{ url_for('home') }}"{% if view == 'home' %} style="font-weight:600;color:var(--text);"{% endif %}>Home</a>
+    &nbsp;·&nbsp;
+    <a href="{{ url_for('discover_page') }}"{% if view == 'discover' %} style="font-weight:600;color:var(--text);"{% endif %}>Discover</a>
+    &nbsp;·&nbsp;
+    <a href="{{ url_for('company_data_page') }}"{% if view == 'company_data' %} style="font-weight:600;color:var(--text);"{% endif %}>Company Data</a>
+    &nbsp;·&nbsp;
+    <a href="{{ url_for('isin_check_page') }}"{% if view == 'isin_check' %} style="font-weight:600;color:var(--text);"{% endif %}>ISIN Check</a>
     {% if view == 'company' %} · {{ company.isin }}{% endif %}
   </span>
 </header>
@@ -131,26 +137,84 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
 
   <div class="panel">
     <h2>Source index cache</h2>
-    <p class="muted">Local cache of each site's company list used for fuzzy slug search. Refresh as needed (rarely).</p>
+    <p class="muted">Local cache of each site's company list used for fuzzy slug search. Refresh-all runs every source in parallel.</p>
     <div class="row">
       {% for src in sources %}
-      <div style="flex:1 1 160px;">
+      {% set cnt = index_counts.get(src, 0) %}
+      {% set meta = (index_meta or {}).get(src, {}) %}
+      {% set is_live = src in (live_search or []) %}
+      {% set has_error = meta.get('last_error') %}
+      <div style="flex:1 1 180px;" data-source-card="{{ src }}">
         <div class="inline" style="justify-content:space-between;">
           <strong>{{ src }}</strong>
-          {% set cnt = index_counts.get(src, 0) %}
-          <span class="idx-pill {% if cnt %}ok{% else %}empty{% endif %}">{{ cnt }}</span>
+          {% if is_live %}
+            <span class="idx-pill" style="background:#1a2a3a; color:#7cc4ff;" title="Live search — no local index needed">live</span>
+          {% else %}
+            <span class="idx-pill {% if has_error %}empty{% elif cnt %}ok{% else %}empty{% endif %}"
+                  data-count-pill>{{ cnt }}</span>
+          {% endif %}
+        </div>
+        <div class="muted" style="margin-top:4px; font-size:11px; min-height:16px;" data-last-refreshed>
+          {% if is_live %}
+            live endpoint — nothing to cache
+          {% elif has_error %}
+            <span style="color:var(--danger);" title="{{ meta.last_error }}">⚠ {{ meta.last_error|truncate(40, True) }}</span>
+          {% elif meta.get('last_refreshed') %}
+            refreshed {{ meta.last_refreshed[:16].replace('T',' ') }}
+            {% if meta.get('last_duration_ms') %}<span class="muted">({{ meta.last_duration_ms }}ms)</span>{% endif %}
+          {% else %}
+            never refreshed
+          {% endif %}
         </div>
         <button class="ghost" style="margin-top:6px; width:100%;" onclick="refreshIndex('{{ src }}', this)">Refresh</button>
       </div>
       {% endfor %}
     </div>
     <hr>
-    <button onclick="refreshAll(this)">↻ Refresh all</button>
+    <button class="primary" onclick="refreshAll(this)">↻ Refresh all (parallel)</button>
+    <span id="refreshAllStatus" class="muted" style="margin-left:10px;"></span>
   </div>
+
+  {% if auto_scrape_companies %}
+  <div class="panel">
+    <h2>
+      Auto-scrape list ({{ auto_scrape_companies | length }})
+      <span class="muted" style="font-weight:normal; text-transform:none; letter-spacing:0; margin-left:8px;">
+        · runs daily at {{ auto_scrape_time }}
+      </span>
+    </h2>
+    <p class="muted">
+      These companies are scraped automatically once per day <strong>at {{ auto_scrape_time }}</strong>.
+      The scheduled run is <strong>incremental</strong> — it only appends rows on dates
+      not already on disk, preserving existing history. Click
+      <strong>Run all now</strong> to trigger an <strong>immediate full re-scrape</strong>
+      (overwrites every per-source CSV from scratch).
+    </p>
+    <table>
+      <thead><tr><th>ISIN</th><th>Name</th><th>Sources</th><th>Last auto-run</th><th></th></tr></thead>
+      <tbody>
+      {% for c in auto_scrape_companies %}
+      <tr>
+        <td style="font-family:ui-monospace,monospace;">{{ c.isin }}</td>
+        <td>{{ c.display_name }}</td>
+        <td><span class="pill">{{ c.configured_sources }}/{{ sources|length }}</span></td>
+        <td class="muted">{{ c.auto_scrape_last_run or '—' }}</td>
+        <td><a href="{{ url_for('view_company', isin=c.isin) }}">Open →</a></td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div style="margin-top:12px;" class="inline">
+      <button class="primary" id="runAllAutoBtn" onclick="runAllAutoScrape(this)">▶ Run all now</button>
+      <span id="runAllAutoStatus" class="muted"></span>
+    </div>
+  </div>
+  {% endif %}
 
   <div class="panel">
     {% set scraped_count = companies | selectattr('scraped') | list | length %}
     {% set not_scraped = companies | rejectattr('scraped') | list %}
+    {% set configured_count = companies | selectattr('configured_sources') | list | length %}
     <h2>
       Companies ({{ companies | length }})
       <span class="status-pill ok" style="margin-left:10px;">✓ Scraped: {{ scraped_count }}</span>
@@ -158,6 +222,11 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
         ✗ Not scraped: {{ not_scraped | length }}
       </span>
     </h2>
+    <div class="inline" style="margin-bottom:12px; gap:10px; flex-wrap:wrap;">
+      <button class="primary" id="scrapeAllBtn" onclick="scrapeAll(this)">▶ Scrape ALL {{ configured_count }} configured companies</button>
+      <span id="scrapeAllStatus" class="muted"></span>
+      <span class="muted" style="margin-left:auto;">Writes <code>combined.csv</code> + <code>main_realtime.csv</code> per company. Blocking — can take 10+ minutes.</span>
+    </div>
     {% if not_scraped %}
     <div class="banner">
       <strong>⚠ {{ not_scraped | length }} companies still need scraping:</strong>
@@ -173,7 +242,7 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
       <button class="ghost" onclick="filterCompanies('not_scraped', this)">Not scraped</button>
     </div>
     <table id="companiesTable">
-      <thead><tr><th>ISIN</th><th>Name</th><th>Sources</th><th>Scraped?</th><th>Rows</th><th>Last scraped</th><th></th></tr></thead>
+      <thead><tr><th>ISIN</th><th>Name</th><th>Sources</th><th>Scraped?</th><th>Rows</th><th>Last scraped</th><th title="Include in daily auto-scrape (09:30 IST)">Auto</th><th></th></tr></thead>
       <tbody>
       {% for c in companies %}
       <tr data-scraped="{{ 'yes' if c.scraped else 'no' }}"
@@ -190,6 +259,14 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
         </td>
         <td class="muted">{{ '{:,}'.format(c.combined_rows) if c.scraped else '—' }}</td>
         <td class="muted">{{ c.combined_mtime or '—' }}</td>
+        <td style="text-align:center;">
+          <input type="checkbox" class="auto-scrape-cb"
+                 {% if c.auto_scrape %}checked{% endif %}
+                 {% if c.configured_sources == 0 %}disabled title="Configure a source first"{% else %}title="Include in daily auto-scrape"{% endif %}
+                 data-isin="{{ c.isin }}"
+                 onchange="toggleAutoScrapeRow(this)"
+                 style="width:16px; height:16px; accent-color:var(--accent2); cursor:pointer;">
+        </td>
         <td><a href="{{ url_for('view_company', isin=c.isin) }}">Open →</a></td>
       </tr>
       {% endfor %}
@@ -322,8 +399,26 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
       <code>extracted/{{ company.isin }}/</code> (per-source + <code>combined.csv</code>).
       CSV schema: <code>Datetime;Price;Source;Tag;Note;Link</code>.
     </p>
+    <div class="inline" style="margin-bottom:12px; gap:10px; padding:10px 12px;
+         border:1px solid var(--border); border-radius:8px; background:#12151c;">
+      <input type="checkbox" id="autoScrapeCheckbox"
+             {% if company.auto_scrape %}checked{% endif %}
+             {% if configured_sources == 0 %}disabled{% endif %}
+             onchange="toggleAutoScrape(this)"
+             style="width:16px; height:16px; accent-color:var(--accent2);">
+      <label for="autoScrapeCheckbox" style="margin:0; color:var(--text); cursor:pointer;">
+        <strong>Include in daily auto-scrape</strong>
+        <span class="muted">&nbsp;· fires once daily at {{ auto_scrape_time }}</span>
+      </label>
+      {% if configured_sources == 0 %}
+      <span class="muted" style="margin-left:auto;">Configure at least one source slug first.</span>
+      {% elif company.auto_scrape_last_run %}
+      <span class="muted" style="margin-left:auto;">Last auto-run: {{ company.auto_scrape_last_run }}</span>
+      {% endif %}
+    </div>
     <button class="primary" id="runBtn" onclick="runScrape()">▶ Run scraper</button>
     <a id="combinedLink" class="btn" style="margin-left:10px; display:none;" href="#">⬇ Download combined.csv</a>
+    <a id="realtimeLink" class="btn" style="margin-left:10px; display:none;" href="#">⬇ Download main_realtime.csv</a>
     <button class="ghost" id="rebuildBtn" style="margin-left:10px;" onclick="rebuildCombined()">↻ Regenerate combined</button>
     <button class="ghost" id="revealBtn" style="margin-left:10px;" onclick="revealFolder()">📂 Open folder</button>
     <button class="ghost" id="auditBtn" style="margin-left:10px; display:none;" onclick="refreshAudit()">🔍 Re-check data quality</button>
@@ -344,6 +439,171 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
     .audit-row .badge.green{background:#dcfce7;color:#166534}
     .audit-row .badge.gray{background:#e5e7eb;color:#374151}
   </style>
+
+{% elif view == 'isin_check' %}
+
+  <div class="panel">
+    <h2>ISIN check — per source</h2>
+    <p class="muted">
+      For every registered company, we fetch each configured source page,
+      extract the ISIN it shows, and compare with what's in <code>registry.db</code>.
+      The <strong>Match</strong> column shows how many configured sources report
+      the registered ISIN — <code>N/M</code> where <code>M</code> is the number
+      of sources you've set up for that company.
+      Results are cached to disk — this page loads the most recent saved check
+      instantly. Click <strong>▶ Run check</strong> to re-fetch (~20s).
+    </p>
+    <div class="inline" style="gap:10px; flex-wrap:wrap; margin-bottom:10px;">
+      <button class="primary" id="icBtn" onclick="icRun()">▶ Run check</button>
+      <a class="btn" href="/admin/check-isins/download-matrix.csv" title="One row per company, one column per source — mirrors the table below">⬇ Download matrix CSV</a>
+      <a class="btn ghost" href="/admin/check-isins/download.csv" title="One row per (company × source) check — long format with slug / URL / verdict / error">⬇ Detailed (long) CSV</a>
+      <input type="search" id="icFilter" placeholder="Filter by ISIN, name, slug…" style="flex:1 1 280px;">
+      <select id="icStatusFilter" style="padding:9px 12px; background:#0c0e13; color:var(--text); border:1px solid var(--border); border-radius:7px;">
+        <option value="">Show: all</option>
+        <option value="full">Full match (all sources agree)</option>
+        <option value="partial">Partial match (some agree)</option>
+        <option value="none">Zero matches / discrepancies</option>
+      </select>
+      <span id="icStatus" class="muted"></span>
+    </div>
+    <div id="icBody"><p class="muted">Click <strong>▶ Run check</strong> to fetch every source page (~20s).</p></div>
+    <style>
+      #icTable { font-size:12px; min-width:1400px; }
+      #icTable th { font-size:11px; }
+      #icTable td { padding:5px 6px; vertical-align:middle; }
+      .ic-match    { color:var(--accent2); }
+      .ic-mismatch { color:var(--danger); background:rgba(255,107,107,0.12); font-weight:600; }
+      .ic-missing  { color:#f59e0b; background:rgba(245,158,11,0.12); font-weight:600; }
+      .ic-error    { color:var(--muted); background:rgba(138,147,166,0.08); }
+      .ic-empty    { color:var(--muted); opacity:0.6; }
+      .ic-score    { font-weight:700; font-family:ui-monospace,monospace; }
+      .ic-score.full  { color:var(--accent2); }
+      .ic-score.part  { color:#f59e0b; }
+      .ic-score.none  { color:var(--danger); }
+    </style>
+  </div>
+
+{% elif view == 'company_data' %}
+
+  <div class="panel">
+    <h2>Company data — ISIN / CIN / RTA / Face value / …</h2>
+    <p class="muted">
+      Canonical company metadata. Edit any row then press <kbd>Enter</kbd> or
+      Save. Use <strong>Check against sources</strong> to cross-validate every
+      stored value against what the source pages report (same pattern as the
+      ISIN checker on the home page).
+    </p>
+    <div class="inline" style="gap:10px; flex-wrap:wrap; margin-bottom:10px;">
+      <button class="primary" id="cdExtractBtn" onclick="runCompanyDataExtract()" title="Fetch every source page, extract every field, and fill empty cells with the value ≥2 sources agree on.">▶ Auto-extract from sources</button>
+      <label class="inline" style="gap:4px; font-size:12px;" title="Tick to also replace already-populated cells with the new majority-vote winner. Unchecked only fills empty cells.">
+        <input type="checkbox" id="cdOverwriteToggle">
+        <span>overwrite existing</span>
+      </label>
+      <button class="ghost" id="cdCheckBtn" onclick="runCompanyDataCheck()">⚖ Check against sources</button>
+      <a class="btn" href="/admin/company-data/download.csv" title="Download the table below as CSV">⬇ Export CSV</a>
+      <input type="search" id="cdFilter" placeholder="Filter by ISIN, name, CIN, RTA, PAN…" style="flex:1 1 280px;">
+      <span id="cdStatus" class="muted"></span>
+    </div>
+    <div style="overflow-x:auto;">
+      <table id="cdTable" style="font-size:12px; min-width:1000px;">
+        <thead>
+          <tr>
+            <th style="width:130px;">ISIN</th>
+            <th>Name</th>
+            <th>CIN (21 char)</th>
+            <th>RTA</th>
+            <th style="width:80px;">Face value</th>
+            <th style="width:120px;">Incorporated</th>
+            <th style="width:110px;">PAN</th>
+            <th style="width:80px;"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for c in companies %}
+          <tr data-isin="{{ c.isin }}" data-search="{{ (c.isin ~ ' ' ~ c.display_name ~ ' ' ~ c.cin ~ ' ' ~ c.rta ~ ' ' ~ c.pan) | lower }}">
+            <td style="font-family:ui-monospace,monospace; font-weight:600;">{{ c.isin }}</td>
+            <td><a href="{{ url_for('view_company', isin=c.isin) }}">{{ c.display_name }}</a></td>
+            <td><input type="text" name="cin" value="{{ c.cin }}" data-field="cin" style="font-family:ui-monospace,monospace; font-size:12px;"></td>
+            <td><input type="text" name="rta" value="{{ c.rta }}" data-field="rta"></td>
+            <td><input type="text" name="face_value" value="{{ c.face_value }}" data-field="face_value" style="text-align:right;"></td>
+            <td><input type="text" name="incorporated_on" value="{{ c.incorporated_on }}" data-field="incorporated_on" placeholder="YYYY-MM-DD"></td>
+            <td><input type="text" name="pan" value="{{ c.pan }}" data-field="pan" style="font-family:ui-monospace,monospace; font-size:12px;"></td>
+            <td style="text-align:right;"><button class="primary" onclick="cdSave('{{ c.isin }}', this)">Save</button></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div id="cdCheckResults" style="margin-top:16px; display:none;"></div>
+    <style>
+      #cdTable input[type=text] { width:100%; padding:5px 7px; font-size:12px; background:#0c0e13; border:1px solid var(--border); color:var(--text); border-radius:5px; }
+      #cdTable input[type=text]:focus { outline:none; border-color:var(--accent); }
+      #cdTable .dirty input[type=text] { border-color:#f59e0b; }
+      #cdTable button.primary { padding:5px 10px; font-size:11px; }
+      #cdTable th { font-size:11px; }
+      #cdTable td { padding:5px 6px; vertical-align:top; }
+      .cd-cell-match    { background:rgba(54,196,141,0.14); }
+      .cd-cell-mismatch { background:rgba(255,107,107,0.18); color:var(--danger); font-weight:600; }
+      .cd-cell-notfound { background:rgba(245,158,11,0.14); color:#d97706; }
+      .cd-cell-error    { background:rgba(138,147,166,0.12); color:var(--muted); }
+    </style>
+  </div>
+
+{% elif view == 'discover' %}
+
+  <div class="panel">
+    <h2>Download company lists</h2>
+    <p class="muted">
+      Every company/product the scraper knows about on each source, as downloadable CSVs
+      (<code>slug,display,url</code>). These are the cached source-index rows — refresh them
+      on the <a href="{{ url_for('home') }}">home page</a> via <em>↻ Refresh all (parallel)</em>
+      to pick up anything newly added upstream.
+    </p>
+    <table style="margin-top:10px;">
+      <thead>
+        <tr>
+          <th>Source</th>
+          <th style="width:110px;">Companies</th>
+          <th>Last refreshed</th>
+          <th style="width:180px;"></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for src in sources %}
+      {% set cnt = index_counts.get(src, 0) %}
+      {% set meta = (index_meta or {}).get(src, {}) %}
+      {% set has_error = meta.get('last_error') %}
+      <tr>
+        <td style="font-weight:600;">{{ src }}</td>
+        <td>
+          <span class="idx-pill {% if has_error %}empty{% elif cnt %}ok{% else %}empty{% endif %}">{{ cnt }}</span>
+        </td>
+        <td class="muted" style="font-size:12px;">
+          {% if has_error %}
+            <span style="color:var(--danger);" title="{{ meta.last_error }}">⚠ {{ meta.last_error|truncate(60, True) }}</span>
+          {% elif meta.get('last_refreshed') %}
+            {{ meta.last_refreshed[:16].replace('T',' ') }}
+            {% if meta.get('last_duration_ms') %}<span class="muted">({{ meta.last_duration_ms }}ms)</span>{% endif %}
+          {% else %}
+            never refreshed
+          {% endif %}
+        </td>
+        <td>
+          {% if cnt %}
+            <a class="btn primary" href="{{ url_for('source_catalog_download', source=src) }}">⬇ Download CSV</a>
+          {% else %}
+            <span class="muted">empty — refresh first</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div style="margin-top:16px; padding-top:14px; border-top:1px solid var(--border);">
+      <a class="btn primary" href="{{ url_for('all_catalogs_download') }}">⬇ Download combined CSV (every source)</a>
+      <span class="muted" style="margin-left:10px;">One file, extra <code>source</code> column up front.</span>
+    </div>
+  </div>
 
 {% endif %}
 
@@ -398,20 +658,149 @@ if (newForm) {
 }
 
 // ---------- index refresh ----------
-async function refreshIndex(source, btn) {
-  btn.disabled = true; btn.textContent = 'Refreshing…';
-  const r = await fetch('/admin/refresh-index/' + source, {method:'POST'});
-  const j = await r.json();
-  btn.disabled = false;
-  btn.textContent = j.ok ? `Refreshed (${j.count})` : 'Failed';
-  setTimeout(() => { location.reload(); }, 600);
+function _updateSourceCard(source, result) {
+  const card = document.querySelector(`[data-source-card="${source}"]`);
+  if (!card) return;
+  const pill = card.querySelector('[data-count-pill]');
+  const info = card.querySelector('[data-last-refreshed]');
+  if (pill) {
+    pill.textContent = result.count != null ? result.count : '?';
+    pill.classList.remove('ok', 'empty');
+    pill.classList.add((result.ok && result.count > 0) ? 'ok' : 'empty');
+  }
+  if (info) {
+    if (result.ok) {
+      const d = result.duration_ms != null ? ` (${result.duration_ms}ms)` : '';
+      info.innerHTML = `refreshed just now<span class="muted">${d}</span>`;
+    } else {
+      info.innerHTML = `<span style="color:var(--danger);" title="${esc(result.error || '')}">⚠ ${esc((result.error || 'failed').slice(0, 40))}</span>`;
+    }
+  }
 }
+
+async function refreshIndex(source, btn) {
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Refreshing…';
+  try {
+    const r = await fetch('/admin/refresh-index/' + source, {method:'POST'});
+    const j = await r.json();
+    _updateSourceCard(source, j);
+    btn.textContent = j.ok ? `Refreshed (${j.count})` : '✗ Failed';
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1500);
+  } catch (e) {
+    _updateSourceCard(source, {ok:false, error: e.message, count: 0});
+    btn.textContent = '✗ Error';
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 1500);
+  }
+}
+
 async function refreshAll(btn) {
-  btn.disabled = true; btn.textContent = 'Refreshing all…';
-  const r = await fetch('/admin/refresh-all', {method:'POST'});
-  const j = await r.json();
-  alert('Refresh done:\n' + JSON.stringify(j, null, 2));
-  location.reload();
+  const orig = btn.textContent;
+  const status = document.getElementById('refreshAllStatus');
+  btn.disabled = true; btn.textContent = '⏳ Refreshing in parallel…';
+  if (status) status.textContent = 'Running all 7 sources in parallel…';
+  try {
+    const r = await fetch('/admin/refresh-all', {method:'POST'});
+    const j = await r.json();
+    // Update every card in place — no reload.
+    for (const [src, res] of Object.entries(j.results || {})) {
+      _updateSourceCard(src, res);
+    }
+    const ok = j.ok_count, total = j.total, ms = j.duration_ms;
+    btn.textContent = `✓ ${ok}/${total} in ${ms}ms`;
+    if (status) {
+      const failed = Object.entries(j.results || {}).filter(([_,r]) => !r.ok);
+      status.textContent = failed.length
+        ? `${ok}/${total} succeeded — failed: ${failed.map(([s]) => s).join(', ')}`
+        : `all ${ok} sources refreshed in ${ms}ms`;
+    }
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 3000);
+  } catch (e) {
+    btn.textContent = '✗ ' + e.message;
+    if (status) status.textContent = 'Error: ' + e.message;
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 3000);
+  }
+}
+
+async function toggleAutoScrapeRow(cb) {
+  const isin = cb.dataset.isin;
+  const wanted = cb.checked;
+  cb.disabled = true;
+  const fd = new FormData();
+  fd.append('enabled', wanted ? 'true' : 'false');
+  try {
+    const r = await fetch(`/company/${isin}/auto-scrape`, {method:'POST', body: fd});
+    if (!r.ok) {
+      cb.checked = !wanted;
+      alert('Auto-scrape: ' + (await r.text()).replace(/<[^>]+>/g, '').trim());
+    } else {
+      // Reload so the "Auto-scrape list" panel at the top reflects the change.
+      location.reload();
+      return;
+    }
+  } catch (e) {
+    cb.checked = !wanted;
+    alert('Auto-scrape error: ' + e.message);
+  }
+  cb.disabled = false;
+}
+
+function _summariseBatch(results) {
+  const ok = results.filter(x => x.ok).length;
+  const realtimeRows = results
+    .filter(x => x.ok && x.realtime_rows != null)
+    .reduce((s, x) => s + x.realtime_rows, 0);
+  const combinedRows = results
+    .filter(x => x.ok && x.combined_total != null)
+    .reduce((s, x) => s + x.combined_total, 0);
+  return { ok, total: results.length, realtimeRows, combinedRows };
+}
+
+async function runAllAutoScrape(btn) {
+  const status = document.getElementById('runAllAutoStatus');
+  btn.disabled = true; btn.textContent = '⏳ Scraping…';
+  if (status) status.textContent = 'Running — this can take a minute per company. Creates combined.csv + main_realtime.csv per company.';
+  try {
+    const r = await fetch('/admin/auto-scrape/run-now', {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      if (status) status.textContent = 'Error: ' + (j.error || 'unknown');
+      btn.disabled = false; btn.textContent = '▶ Run all now';
+      return;
+    }
+    const s = _summariseBatch(j.results || []);
+    if (status) {
+      status.textContent = `✓ ${s.ok}/${s.total} succeeded — ${s.combinedRows.toLocaleString()} combined rows, ${s.realtimeRows.toLocaleString()} realtime rows. Reloading…`;
+    }
+    setTimeout(() => location.reload(), 1800);
+  } catch (e) {
+    if (status) status.textContent = 'Error: ' + e.message;
+    btn.disabled = false; btn.textContent = '▶ Run all now';
+  }
+}
+
+async function scrapeAll(btn) {
+  const status = document.getElementById('scrapeAllStatus');
+  if (!confirm('Scrape ALL configured companies now? This can take 10+ minutes. Each company gets a new combined.csv and main_realtime.csv.')) return;
+  btn.disabled = true; btn.textContent = '⏳ Scraping all…';
+  if (status) status.textContent = 'Running — writing combined + main_realtime per company…';
+  try {
+    const r = await fetch('/admin/scrape-all', {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      if (status) status.textContent = 'Error: ' + (j.error || 'unknown');
+      btn.disabled = false; btn.textContent = '▶ Scrape ALL';
+      return;
+    }
+    const s = _summariseBatch(j.results || []);
+    if (status) {
+      status.textContent = `✓ ${s.ok}/${s.total} succeeded — ${s.combinedRows.toLocaleString()} combined rows, ${s.realtimeRows.toLocaleString()} realtime rows. Reloading…`;
+    }
+    setTimeout(() => location.reload(), 1800);
+  } catch (e) {
+    if (status) status.textContent = 'Error: ' + e.message;
+    btn.disabled = false; btn.textContent = '▶ Scrape ALL';
+  }
 }
 
 // ---------- company: identity form ----------
@@ -538,9 +927,17 @@ async function runScrape() {
       const s = j.summary;
       let txt = `Scraped ${s.total} rows\n\nPer-source:\n`;
       for (const [k,v] of Object.entries(s.counts)) txt += `  ${k.padEnd(14)} ${v}\n`;
+      if (s.realtime_rows != null) {
+        txt += `\nmain_realtime.csv: ${s.realtime_rows} rows (one per day, median price)\n`;
+      }
       log.textContent = txt;
       link.href = s.combined_url;
       link.style.display = 'inline-block';
+      const rtLink = document.getElementById('realtimeLink');
+      if (rtLink && s.realtime_url) {
+        rtLink.href = s.realtime_url;
+        rtLink.style.display = 'inline-block';
+      }
       document.getElementById('auditBtn').style.display = 'inline-block';
       files.style.display = 'block';
       files.innerHTML = '<div class="muted" style="margin-bottom:6px;">Per-source files:</div>' +
@@ -614,10 +1011,16 @@ async function rebuildCombined() {
       const rb = j.rebuild || {};
       log.textContent = `Combined rebuilt: ${rb.rows} rows` +
         (rb.excluded && rb.excluded.length ? ` (excluded: ${rb.excluded.join(', ')})` : ' (no exclusions)') +
+        (rb.realtime_rows != null ? `; main_realtime: ${rb.realtime_rows} rows (one per day)` : '') +
         `\nFile: ${rb.combined_name || rb.combined}`;
       if (rb.combined_url) {
         link.href = rb.combined_url;
         link.style.display = 'inline-block';
+      }
+      const rtLink = document.getElementById('realtimeLink');
+      if (rtLink && rb.realtime_url) {
+        rtLink.href = rb.realtime_url;
+        rtLink.style.display = 'inline-block';
       }
       document.getElementById('auditBtn').style.display = 'inline-block';
       if (rb.audit) renderAudit(rb.audit);
@@ -645,6 +1048,32 @@ async function revealFolder() {
     log.textContent = 'Open-folder error: ' + e.message;
   }
   btn.disabled = false;
+}
+
+async function toggleAutoScrape(checkbox) {
+  const fd = new FormData();
+  fd.append('enabled', checkbox.checked ? 'true' : 'false');
+  const log = document.getElementById('runLog');
+  try {
+    const r = await fetch(`/company/${ISIN}/auto-scrape`, {method:'POST', body: fd});
+    if (!r.ok) {
+      // Revert the checkbox on rejection and surface the server message.
+      checkbox.checked = !checkbox.checked;
+      const txt = await r.text();
+      if (log) { log.style.display = 'block'; log.textContent = 'Auto-scrape: ' + txt; }
+      return;
+    }
+    const j = await r.json();
+    if (log) {
+      log.style.display = 'block';
+      log.textContent = j.auto_scrape
+        ? '✓ Added to daily auto-scrape list.'
+        : '✓ Removed from auto-scrape list.';
+    }
+  } catch (e) {
+    checkbox.checked = !checkbox.checked;
+    if (log) { log.style.display = 'block'; log.textContent = 'Auto-scrape error: ' + e.message; }
+  }
 }
 
 async function excludeFromAudit(source, btn) {
@@ -697,16 +1126,30 @@ function openAllSources(btn) {
     alert('No source pages configured yet — auto-search or paste slugs first.');
     return;
   }
-  // Most browsers only allow a single popup per user-gesture. Stagger opens so
-  // the popup blocker sees each one as responding to the original click.
-  links.forEach((url, i) => {
-    setTimeout(() => window.open(url, '_blank', 'noopener'), i * 80);
-  });
+  // Synthesize anchor clicks synchronously inside this handler. Any async
+  // delay (setTimeout / await) detaches subsequent window.open calls from
+  // the user gesture and the browser blocks them as popups.
+  let opened = 0;
+  for (const url of links) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    opened++;
+  }
   if (btn) {
     const orig = btn.textContent;
     btn.disabled = true;
-    btn.textContent = `↗ Opened ${links.length}…`;
+    btn.textContent = `↗ Opened ${opened}…`;
     setTimeout(() => { btn.disabled = false; btn.textContent = orig; }, 1200);
+  }
+  // First-time user hint: if the browser still blocks after the first tab,
+  // point at the popup-block UI.
+  if (opened > 1) {
+    console.info(`[openAllSources] dispatched ${opened} anchor clicks. If only one tab opened, click the popup-blocked icon in the address bar and allow pop-ups for this site.`);
   }
 }
 
@@ -735,6 +1178,449 @@ function autoSearchAll(query) {
 
 // ---------- util ----------
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+// Discover page is a static download list — no JS required.
+
+// ---------- /isin-check page ----------
+const IC_VIEW = {% if view == 'isin_check' %}true{% else %}false{% endif %};
+const IC_SOURCES = {{ sources|tojson if view == 'isin_check' else '[]' }};
+
+function _icStatusLine(j, suffix) {
+  const s = j.summary || {};
+  const gen = j.generated_at ? new Date(j.generated_at).toLocaleString() : '—';
+  return `last run: ${gen} · total checks: ${s.total} · ${s.matches} match · ${s.mismatches} mismatch · ${s.errors} error${suffix ? ' · ' + suffix : ''}`;
+}
+
+async function icLoadSaved() {
+  // Load the most recent saved check from disk without re-running.
+  const status = document.getElementById('icStatus');
+  const body = document.getElementById('icBody');
+  try {
+    const r = await fetch('/admin/check-isins/latest');
+    if (r.status === 404) {
+      body.innerHTML = '<p class="muted">No ISIN check has been run yet. Click <strong>▶ Run check</strong> above to generate one (takes ~20s).</p>';
+      status.textContent = 'no saved check';
+      return;
+    }
+    const j = await r.json();
+    if (!j.ok) {
+      body.innerHTML = '<p class="muted">Couldn\'t load saved check: ' + esc(j.error || 'unknown') + '</p>';
+      return;
+    }
+    _icRender(j);
+    status.textContent = _icStatusLine(j);
+  } catch (e) {
+    body.innerHTML = '<p class="muted">Error loading saved check: ' + esc(e.message) + '</p>';
+  }
+}
+
+async function icRun() {
+  const btn = document.getElementById('icBtn');
+  const status = document.getElementById('icStatus');
+  const body = document.getElementById('icBody');
+  btn.disabled = true; btn.textContent = '⏳ Checking…';
+  status.textContent = 'fetching every source page (~20s)…';
+  body.innerHTML = '<p class="muted">Running in parallel, 8 workers…</p>';
+  try {
+    const r = await fetch('/admin/check-isins', {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      status.textContent = 'Error: ' + (j.error || 'unknown');
+    } else {
+      _icRender(j);
+      status.textContent = _icStatusLine(j, 'saved — download buttons now serve this result');
+    }
+  } catch (e) { status.textContent = 'Error: ' + e.message; }
+  btn.disabled = false; btn.textContent = '▶ Run check';
+}
+
+function _icRender(j) {
+  const body = document.getElementById('icBody');
+  // Per-company summary: count matches and denominator (configured sources).
+  const rows = j.companies.map(co => {
+    const configured = co.checks.length;
+    let matches = 0, mismatches = 0, missing = 0, errors = 0;
+    const cells = IC_SOURCES.map(src => {
+      const ck = co.checks.find(c => c.source === src);
+      if (!ck) return {cls:'ic-empty', text:'—', title:'no slug configured'};
+      if (ck.error) { errors++; return {cls:'ic-error', text:'error', title: ck.error}; }
+      const found = (ck.found && ck.found.length) ? ck.found[0] : '';
+      if (!found) { missing++; return {cls:'ic-missing', text:'✗ none on page', title:'no ISIN on page — slug likely wrong\n' + (ck.url||'')}; }
+      if (ck.match) { matches++; return {cls:'ic-match', text:'✓ '+found, title: ck.url||''}; }
+      mismatches++;
+      return {cls:'ic-mismatch', text:'✗ '+found, title: 'differs from registered\n' + (ck.url||'')};
+    });
+    const scoreClass = matches === 0 ? 'none' : (matches === configured ? 'full' : 'part');
+    return {co, configured, matches, mismatches, missing, errors, cells, scoreClass};
+  });
+  // Sort: least-matching first (most urgent), then by name
+  rows.sort((a, b) => {
+    if (a.matches !== b.matches) return a.matches - b.matches;
+    return a.co.name.localeCompare(b.co.name);
+  });
+
+  const thead = `
+    <thead>
+      <tr>
+        <th style="width:140px;">Registered ISIN</th>
+        <th>Company</th>
+        <th style="width:80px; text-align:center;">Match</th>
+        ${IC_SOURCES.map(s => `<th style="min-width:140px;">${esc(s)}</th>`).join('')}
+      </tr>
+    </thead>`;
+  const tbody = rows.map(r => {
+    const search = (r.co.isin + ' ' + r.co.name + ' ' + r.co.checks.map(c => c.slug||'').join(' ')).toLowerCase();
+    const kind = r.matches === 0 ? 'none' : (r.matches === r.configured ? 'full' : 'partial');
+    return `<tr data-search="${esc(search)}" data-kind="${kind}">
+      <td style="font-family:ui-monospace,monospace; font-weight:600;">${esc(r.co.isin)}</td>
+      <td><a href="/company/${esc(r.co.isin)}">${esc(r.co.name)}</a></td>
+      <td style="text-align:center;"><span class="ic-score ${r.scoreClass}">${r.matches}/${r.configured}</span></td>
+      ${r.cells.map(c => `<td class="${c.cls}" title="${esc(c.title||'')}" style="font-family:ui-monospace,monospace;">${esc(c.text)}</td>`).join('')}
+    </tr>`;
+  }).join('');
+
+  // Top-level match-count histogram
+  const fullCount  = rows.filter(r => r.matches === r.configured && r.configured > 0).length;
+  const partCount  = rows.filter(r => r.matches > 0 && r.matches < r.configured).length;
+  const noneCount  = rows.filter(r => r.configured > 0 && r.matches === 0).length;
+  const histo = `
+    <div class="inline" style="gap:14px; margin-bottom:10px; font-size:12px;">
+      <span><strong class="ic-match">${fullCount}</strong> full match</span>
+      <span><strong style="color:#f59e0b;">${partCount}</strong> partial</span>
+      <span><strong class="ic-mismatch" style="background:none;">${noneCount}</strong> zero-match</span>
+      <span class="muted">· click a row's company name to open its registry page</span>
+    </div>`;
+
+  body.innerHTML = histo + `<div style="overflow-x:auto;"><table id="icTable">${thead}<tbody>${tbody}</tbody></table></div>`;
+  icApplyFilters();
+}
+
+function icApplyFilters() {
+  const q = (document.getElementById('icFilter').value || '').trim().toLowerCase();
+  const sf = document.getElementById('icStatusFilter').value;
+  document.querySelectorAll('#icTable tbody tr').forEach(tr => {
+    const textMatch = !q || (tr.dataset.search || '').includes(q);
+    const kindMatch = !sf || tr.dataset.kind === sf;
+    tr.style.display = (textMatch && kindMatch) ? '' : 'none';
+  });
+}
+
+if (IC_VIEW) {
+  document.getElementById('icFilter').addEventListener('input', icApplyFilters);
+  document.getElementById('icStatusFilter').addEventListener('change', icApplyFilters);
+  // Load the most recent saved check from disk. We don't auto-run — the
+  // user clicks ▶ Run check to regenerate.
+  icLoadSaved();
+}
+
+// ---------- company-data page ----------
+const CD_VIEW = {% if view == 'company_data' %}true{% else %}false{% endif %};
+const CD_SOURCES = {{ sources|tojson if view == 'company_data' else '[]' }};
+const CD_CHECKED_FIELDS = ["cin", "rta", "face_value", "incorporated_on"];
+
+if (CD_VIEW) {
+  // Mark rows dirty when any input changes; save on Enter.
+  document.querySelectorAll('#cdTable tbody tr').forEach(tr => {
+    tr.querySelectorAll('input[type=text]').forEach(inp => {
+      inp.addEventListener('input', () => tr.classList.add('dirty'));
+      inp.addEventListener('keydown', e => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          tr.querySelector('button.primary').click();
+        }
+      });
+    });
+  });
+  // Filter
+  document.getElementById('cdFilter').addEventListener('input', e => {
+    const q = e.target.value.trim().toLowerCase();
+    document.querySelectorAll('#cdTable tbody tr').forEach(tr => {
+      tr.style.display = !q || tr.dataset.search.includes(q) ? '' : 'none';
+    });
+  });
+}
+
+async function cdSave(isin, btn) {
+  const tr = btn.closest('tr');
+  const fd = new FormData();
+  tr.querySelectorAll('input[type=text]').forEach(inp => {
+    fd.append(inp.dataset.field, inp.value);
+  });
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await fetch(`/company/${isin}/data`, {method:'POST', body: fd});
+    if (!r.ok) {
+      alert('Save failed: ' + (await r.text()).replace(/<[^>]+>/g,'').trim());
+    } else {
+      tr.classList.remove('dirty');
+      btn.textContent = '✓';
+      setTimeout(() => { btn.textContent = orig; }, 1000);
+    }
+  } catch (e) { alert('Save error: ' + e.message); }
+  btn.disabled = false;
+}
+
+async function runCompanyDataExtract() {
+  const btn = document.getElementById('cdExtractBtn');
+  const status = document.getElementById('cdStatus');
+  const overwrite = document.getElementById('cdOverwriteToggle').checked;
+  if (overwrite && !confirm('Overwrite every existing value with the new majority-vote winner? Manually-entered values will be replaced.')) return;
+  btn.disabled = true; btn.textContent = '⏳ Fetching every source…';
+  status.textContent = 'running — ~30s for the full set';
+  const fd = new FormData();
+  if (overwrite) fd.append('overwrite', 'true');
+  try {
+    const r = await fetch('/admin/extract-company-data', {method:'POST', body: fd});
+    const j = await r.json();
+    if (!j.ok) {
+      status.textContent = 'Error: ' + (j.error || 'unknown');
+    } else {
+      // Summarise: how many companies updated, per-field coverage
+      const fieldCoverage = {};
+      (j.companies || []).forEach(co => {
+        Object.entries(co.winners || {}).forEach(([f, w]) => {
+          if (!fieldCoverage[f]) fieldCoverage[f] = {consensus:0, single:0, none:0};
+          if (w.support >= 2) fieldCoverage[f].consensus++;
+          else if (w.support === 1) fieldCoverage[f].single++;
+          else fieldCoverage[f].none++;
+        });
+      });
+      const fieldSummary = Object.entries(fieldCoverage)
+        .map(([f, c]) => `${f}: ${c.consensus}✓ ${c.single}? ${c.none}—`).join('  ·  ');
+      status.innerHTML = `<strong>Extracted:</strong> ${j.updated}/${j.checked} companies updated, ${j.jobs} pages fetched. Reloading in 2s…<br><span style="font-size:11px;">${fieldSummary}</span>`;
+      setTimeout(() => location.reload(), 2000);
+    }
+  } catch (e) { status.textContent = 'Error: ' + e.message; }
+  btn.disabled = false; btn.textContent = '▶ Auto-extract from sources';
+}
+
+async function runCompanyDataCheck() {
+  const btn = document.getElementById('cdCheckBtn');
+  const status = document.getElementById('cdStatus');
+  const box = document.getElementById('cdCheckResults');
+  btn.disabled = true; btn.textContent = '⏳ Checking…';
+  status.textContent = 'Fetching every source page + extracting CIN / RTA / face value…';
+  box.style.display = 'none';
+  box.innerHTML = '';
+  try {
+    const r = await fetch('/admin/check-company-data', {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      status.textContent = 'Error: ' + (j.error || 'unknown');
+    } else {
+      _cdPaintCheckCells(j);
+      _cdRenderDiscrepancies(j);
+      const s = j.summary;
+      status.textContent = `match=${s.match} mismatch=${s.mismatch} not_found=${s.not_found} error=${s.error}`;
+    }
+  } catch (e) { status.textContent = 'Error: ' + e.message; }
+  btn.disabled = false; btn.textContent = '▶ Check against sources';
+}
+
+function _cdPaintCheckCells(j) {
+  // For each checked field, colour the cell based on worst verdict across
+  // sources: any mismatch → red, else any not_found → orange, else green.
+  j.companies.forEach(co => {
+    const tr = document.querySelector(`#cdTable tr[data-isin="${CSS.escape(co.isin)}"]`);
+    if (!tr) return;
+    CD_CHECKED_FIELDS.forEach(f => {
+      const verdicts = co.checks.map(c => c.verdicts ? c.verdicts[f] : 'error');
+      let cls = '';
+      if (verdicts.includes('mismatch')) cls = 'cd-cell-mismatch';
+      else if (verdicts.some(v => v === 'match')) cls = 'cd-cell-match';
+      else if (verdicts.includes('not_found')) cls = 'cd-cell-notfound';
+      else cls = '';
+      const input = tr.querySelector(`input[data-field="${f}"]`);
+      if (input) {
+        input.parentElement.classList.remove('cd-cell-match','cd-cell-mismatch','cd-cell-notfound','cd-cell-error');
+        if (cls) input.parentElement.classList.add(cls);
+      }
+    });
+  });
+}
+
+function _cdRenderDiscrepancies(j) {
+  const box = document.getElementById('cdCheckResults');
+  const bad = j.companies.filter(co =>
+    co.checks.some(c => c.verdicts && Object.values(c.verdicts).includes('mismatch'))
+  );
+  if (!bad.length) {
+    box.style.display = 'block';
+    box.innerHTML = '<p class="muted">No cross-source mismatches found (for the fields we can extract).</p>';
+    return;
+  }
+  box.style.display = 'block';
+  box.innerHTML = `
+    <h3 style="margin:0 0 8px; font-size:13px; text-transform:uppercase; color:var(--muted);">
+      ${bad.length} companies with at least one field mismatch
+    </h3>
+    ${bad.map(co => {
+      const problems = co.checks.flatMap(c =>
+        Object.entries(c.verdicts || {})
+          .filter(([, v]) => v === 'mismatch')
+          .map(([field, v]) => ({source: c.source, slug: c.slug, url: c.url, field, found: c.extracted[field], registered: co.registered[field]}))
+      );
+      if (!problems.length) return '';
+      return `<div style="padding:10px 12px; border:1px solid var(--border); border-radius:8px; margin-bottom:8px; background:#12151c;">
+        <div><a href="/company/${esc(co.isin)}" style="font-weight:600;">${esc(co.name)}</a> <span class="muted">· ${esc(co.isin)}</span></div>
+        ${problems.map(p => `<div class="muted" style="font-size:12px; margin-top:4px;">
+          <strong style="color:var(--text);">${esc(p.field)}</strong> —
+          <em>${esc(p.source)}</em> reports <code style="color:var(--danger);">${esc(p.found||'?')}</code>
+          ≠ registered <code>${esc(p.registered||'—')}</code>
+          ${p.url ? `· <a target="_blank" rel="noopener" href="${esc(p.url)}">↗ page</a>` : ''}
+        </div>`).join('')}
+      </div>`;
+    }).join('')}`;
+}
+
+// ---------- home: ISIN validator ----------
+const ISIN_SOURCES = ["planify", "unlistedzone", "wwipl", "incredmoney", "sharescart", "altius", "altmoneyvault"];
+
+async function runIsinCheck() {
+  const btn = document.getElementById('isinCheckBtn');
+  const status = document.getElementById('isinCheckStatus');
+  const box = document.getElementById('isinCheckResults');
+  if (!btn) return;
+  btn.disabled = true;
+  btn.textContent = '⏳ Checking… (~45s)';
+  if (status) status.textContent = 'fetching every source page + parsing ISINs in parallel…';
+  box.style.display = 'none';
+  box.innerHTML = '';
+  try {
+    const r = await fetch('/admin/check-isins', {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      if (status) status.textContent = 'Error: ' + (j.error || 'unknown');
+    } else {
+      renderIsinResults(j);
+      const s = j.summary;
+      if (status) status.textContent =
+        `${s.matches}/${s.total} match · ${s.mismatches} mismatch · ${s.errors} error${s.errors===1?'':'s'}`;
+    }
+  } catch (e) {
+    if (status) status.textContent = 'Error: ' + e.message;
+  }
+  btn.disabled = false;
+  btn.textContent = '▶ Check all ISINs';
+}
+
+function renderIsinResults(j) {
+  const box = document.getElementById('isinCheckResults');
+  // Build a matrix: row per company, column per source.
+  //   green  → source reports the registered ISIN (match)
+  //   red    → source reports a *different* ISIN (mismatch, strong discrepancy)
+  //   orange → source page has no ISIN at all (discrepancy — usually wrong slug)
+  //   gray   → network/HTTP error (neither match nor mismatch; need to retry)
+  //   blank  → no slug configured for that source
+  const cellStyle = {
+    match:    'color:var(--accent2);',
+    mismatch: 'color:var(--danger); background:rgba(255,107,107,0.12); font-weight:600;',
+    missing:  'color:#f59e0b; background:rgba(245,158,11,0.12); font-weight:600;',
+    error:    'color:var(--muted); background:rgba(138,147,166,0.10);',
+    none:     'color:var(--muted);',
+  };
+  const thead = `
+    <thead>
+      <tr>
+        <th style="width:140px;">ISIN (registered)</th>
+        <th>Company</th>
+        ${ISIN_SOURCES.map(s => `<th style="min-width:140px;">${esc(s)}</th>`).join('')}
+        <th style="width:70px;">Status</th>
+      </tr>
+    </thead>`;
+  const rows = j.companies.map(co => {
+    let hadMismatch = false, hadMissing = false, hadError = false, hadConfigured = false;
+    const cells = ISIN_SOURCES.map(src => {
+      const ck = co.checks.find(c => c.source === src);
+      if (!ck) return `<td style="${cellStyle.none}; font-size:11px;" title="not configured">—</td>`;
+      hadConfigured = true;
+      if (ck.error) {
+        hadError = true;
+        return `<td style="${cellStyle.error}; font-size:11px;" title="${esc(ck.error)}">⚠ error</td>`;
+      }
+      const found = (ck.found && ck.found.length) ? ck.found[0] : null;
+      if (!found) {
+        hadMissing = true;
+        return `<td style="${cellStyle.missing}; font-size:11px;" title="no ISIN on page — probably wrong slug\nurl: ${esc(ck.url||'')}">✗ none on page</td>`;
+      }
+      const ok = ck.match;
+      if (!ok) hadMismatch = true;
+      const title = (ck.found || []).length > 1
+        ? `also found: ${ck.found.slice(1).join(', ')}\nurl: ${ck.url||''}`
+        : `url: ${ck.url||''}`;
+      const extra = (ck.found || []).length > 1 ? ` <span class="muted">(+${ck.found.length-1})</span>` : '';
+      return `<td title="${esc(title)}" style="font-family:ui-monospace,monospace; font-size:12px; ${ok ? cellStyle.match : cellStyle.mismatch}">${ok?'✓ ':'✗ '}${esc(found)}${extra}</td>`;
+    }).join('');
+    let statusBadge;
+    if (!hadConfigured) {
+      statusBadge = `<span class="status-pill warn">no slugs</span>`;
+    } else if (hadMismatch || hadMissing) {
+      const label = hadMismatch ? 'mismatch' : 'missing';
+      statusBadge = `<span class="status-pill warn">✗ ${label}</span>`;
+    } else if (hadError) {
+      statusBadge = `<span class="status-pill warn">partial</span>`;
+    } else {
+      statusBadge = `<span class="status-pill ok">✓ ok</span>`;
+    }
+    return `<tr data-bad="${hadMismatch || hadMissing ? '1' : '0'}">
+      <td style="font-family:ui-monospace,monospace; font-weight:600;">${esc(co.isin)}</td>
+      <td><a href="/company/${esc(co.isin)}">${esc(co.name)}</a></td>
+      ${cells}
+      <td>${statusBadge}</td>
+    </tr>`;
+  }).join('');
+
+  // Discrepancy shortlist — includes both real mismatches AND "no ISIN on page"
+  // entries (since both usually mean the slug or the registered ISIN is wrong).
+  const bad = j.companies.filter(co =>
+    co.checks.some(c => !c.match && !c.error)
+  );
+  const discHtml = bad.length ? `
+    <h3 style="margin:18px 0 6px; font-size:13px; text-transform:uppercase; color:var(--muted);">
+      ${bad.length} companies with at least one discrepancy
+      <span class="muted" style="text-transform:none; letter-spacing:0; font-weight:normal;">
+        — red = different ISIN, orange = no ISIN on page
+      </span>
+    </h3>
+    ${bad.map(co => {
+      const conflicts = co.checks.filter(c => !c.match && !c.error);
+      return `<div style="padding:10px 12px; border:1px solid var(--border); border-radius:8px; margin-bottom:8px; background:#12151c;">
+        <div><a href="/company/${esc(co.isin)}" style="font-weight:600;">${esc(co.name)}</a> <span class="muted">· registered <code>${esc(co.isin)}</code></span></div>
+        ${conflicts.map(c => {
+          const found = (c.found||[]).join(', ');
+          const kind = found ? 'mismatch' : 'missing';
+          const color = found ? 'var(--danger)' : '#f59e0b';
+          const label = found ? `page shows <code style="color:${color};">${esc(found)}</code>` : `<span style="color:${color};">no ISIN on page (slug likely wrong)</span>`;
+          return `<div class="muted" style="font-size:12px; margin-top:6px;">
+            <span class="status-pill ${kind === 'mismatch' ? 'warn' : 'warn'}" style="font-size:10px;">${kind}</span>
+            <strong style="color:var(--text); margin-left:4px;">${esc(c.source)}</strong>:
+            ${label}
+            · slug <code>${esc(c.slug||'')}</code>
+            ${c.url ? `· <a target="_blank" rel="noopener" href="${esc(c.url)}">↗ open</a>` : ''}
+          </div>`;
+        }).join('')}
+      </div>`;
+    }).join('')}` : '<p class="muted">No discrepancies found — every registered ISIN is visible on every source page.</p>';
+
+  // Count totals for the legend
+  const totalMismatch = j.companies.reduce((s,co) => s + co.checks.filter(c => !c.match && !c.error && c.found && c.found.length).length, 0);
+  const totalMissing  = j.companies.reduce((s,co) => s + co.checks.filter(c => !c.match && !c.error && (!c.found || !c.found.length)).length, 0);
+  const totalError    = j.companies.reduce((s,co) => s + co.checks.filter(c => c.error).length, 0);
+
+  box.style.display = 'block';
+  box.innerHTML = `
+    <div class="inline" style="gap:14px; margin-bottom:10px; font-size:12px;">
+      <span><span style="display:inline-block;width:10px;height:10px;background:var(--accent2);border-radius:2px;"></span> match · ${j.summary.matches}</span>
+      <span><span style="display:inline-block;width:10px;height:10px;background:var(--danger);border-radius:2px;"></span> mismatch · ${totalMismatch}</span>
+      <span><span style="display:inline-block;width:10px;height:10px;background:#f59e0b;border-radius:2px;"></span> no ISIN on page · ${totalMissing}</span>
+      <span><span style="display:inline-block;width:10px;height:10px;background:#8a93a6;border-radius:2px;"></span> fetch error · ${totalError}</span>
+    </div>
+    <div style="overflow-x:auto;">
+      <table style="font-size:12px;">${thead}<tbody>${rows}</tbody></table>
+    </div>
+    ${discHtml}`;
+}
 </script>
 </body>
 </html>

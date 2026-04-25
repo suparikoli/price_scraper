@@ -12,15 +12,20 @@ Run:
 Then open http://127.0.0.1:8765
 """
 
+import csv
 import json
+import os
 import pathlib
 import platform
 import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 
 import requests
 from flask import (
@@ -35,10 +40,18 @@ from flask import (
 from rapidfuzz import fuzz, process
 
 import scrape_prices
+from scrape_prices import IST
+
+# Daily scheduler fires once at this IST time for every company whose
+# `auto_scrape` flag is on. Tweak here — no UI surface for this.
+AUTO_SCRAPE_HOUR_IST = 9
+AUTO_SCRAPE_MINUTE_IST = 30
 
 HERE = pathlib.Path(__file__).parent
 DB_PATH = HERE / "registry.db"
 EXTRACTED_DIR = HERE / "extracted"
+DISCOVERED_DIR = HERE / "discovered"
+DISCOVERED_DIR.mkdir(exist_ok=True)
 EXTRACTED_DIR.mkdir(exist_ok=True)
 
 HEADERS = {
@@ -107,12 +120,14 @@ def init_db():
     with db() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS companies (
-            isin          TEXT PRIMARY KEY,
-            display_name  TEXT NOT NULL,
-            notes         TEXT DEFAULT '',
-            slugs_json    TEXT NOT NULL DEFAULT '{}',
-            excluded_json TEXT NOT NULL DEFAULT '[]',
-            updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            isin                  TEXT PRIMARY KEY,
+            display_name          TEXT NOT NULL,
+            notes                 TEXT DEFAULT '',
+            slugs_json            TEXT NOT NULL DEFAULT '{}',
+            excluded_json         TEXT NOT NULL DEFAULT '[]',
+            auto_scrape           INTEGER NOT NULL DEFAULT 0,
+            auto_scrape_last_run  TEXT,
+            updated_at            TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE TABLE IF NOT EXISTS aliases (
             alias  TEXT PRIMARY KEY,
@@ -124,13 +139,37 @@ def init_db():
             display TEXT NOT NULL,
             PRIMARY KEY(source, slug)
         );
+        CREATE TABLE IF NOT EXISTS source_index_meta (
+            source          TEXT PRIMARY KEY,
+            count           INTEGER NOT NULL DEFAULT 0,
+            last_refreshed  TEXT,            -- ISO 8601 UTC
+            last_duration_ms INTEGER,
+            last_error      TEXT             -- NULL on success
+        );
         CREATE INDEX IF NOT EXISTS idx_aliases_isin ON aliases(isin);
         CREATE INDEX IF NOT EXISTS idx_source_index_source ON source_index(source);
         """)
-        # Migration for older DBs
+        # Migrations for older DBs
         cols = {r["name"] for r in c.execute("PRAGMA table_info(companies)")}
         if "excluded_json" not in cols:
             c.execute("ALTER TABLE companies ADD COLUMN excluded_json TEXT NOT NULL DEFAULT '[]'")
+        if "auto_scrape" not in cols:
+            c.execute("ALTER TABLE companies ADD COLUMN auto_scrape INTEGER NOT NULL DEFAULT 0")
+        if "auto_scrape_last_run" not in cols:
+            c.execute("ALTER TABLE companies ADD COLUMN auto_scrape_last_run TEXT")
+        # Company metadata for cross-source validation (CIN / RTA / face value / etc.)
+        for col in (
+            "cin", "rta", "face_value", "industry", "listing_status",
+            "incorporated_on", "registered_office", "website", "pan",
+        ):
+            if col not in cols:
+                c.execute(f"ALTER TABLE companies ADD COLUMN {col} TEXT")
+
+
+COMPANY_DATA_FIELDS = (
+    "cin", "rta", "face_value", "industry", "listing_status",
+    "incorporated_on", "registered_office", "website", "pan",
+)
 
 
 def company_row_to_dict(row, aliases):
@@ -138,15 +177,58 @@ def company_row_to_dict(row, aliases):
         excluded = json.loads(row["excluded_json"] or "[]")
     except (KeyError, IndexError):
         excluded = []
-    return {
+    try:
+        auto_scrape = bool(row["auto_scrape"])
+    except (KeyError, IndexError):
+        auto_scrape = False
+    try:
+        auto_scrape_last_run = row["auto_scrape_last_run"]
+    except (KeyError, IndexError):
+        auto_scrape_last_run = None
+    out = {
         "isin": row["isin"],
         "display_name": row["display_name"],
         "notes": row["notes"] or "",
         "slugs": json.loads(row["slugs_json"] or "{}"),
         "excluded": excluded,
         "aliases": aliases,
+        "auto_scrape": auto_scrape,
+        "auto_scrape_last_run": auto_scrape_last_run,
         "updated_at": row["updated_at"],
     }
+    # Optional metadata (might be NULL on older rows)
+    for col in COMPANY_DATA_FIELDS:
+        try:
+            out[col] = row[col] or ""
+        except (KeyError, IndexError):
+            out[col] = ""
+    return out
+
+
+def set_company_data(isin: str, fields: dict) -> dict:
+    """Persist optional metadata fields (cin, rta, face_value, etc.). Only
+    keys in COMPANY_DATA_FIELDS are accepted. Empty strings become NULL."""
+    clean = {}
+    for k, v in fields.items():
+        if k not in COMPANY_DATA_FIELDS:
+            continue
+        if v is None:
+            clean[k] = None
+        else:
+            s = str(v).strip()
+            clean[k] = s if s else None
+    if not clean:
+        return {"ok": True, "updated": {}}
+    set_clause = ", ".join(f"{k}=?" for k in clean)
+    with db() as c:
+        if not c.execute("SELECT 1 FROM companies WHERE isin=?", (isin,)).fetchone():
+            abort(404)
+        c.execute(
+            f"UPDATE companies SET {set_clause}, updated_at=datetime('now') WHERE isin=?",
+            (*clean.values(), isin),
+        )
+        c.commit()
+    return {"ok": True, "updated": clean}
 
 
 def get_company(isin):
@@ -170,17 +252,23 @@ def _scrape_status(isin):
       combined_rows    — row count of that CSV (excluding header)
       combined_name    — its filename
       combined_mtime   — ISO timestamp of last modification
+      realtime_exists  — True if a *_main_realtime.csv sits at the folder root
+      realtime_name    — its filename
+      realtime_rows    — row count (one per day) of that CSV
       source_count     — number of per-source CSVs present
     """
-    folder = EXTRACTED_DIR / isin.upper()
+    folder = scrape_prices._find_extracted_folder(isin.upper())
     status = {
         "combined_exists": False,
         "combined_rows": 0,
         "combined_name": None,
         "combined_mtime": None,
+        "realtime_exists": False,
+        "realtime_rows": 0,
+        "realtime_name": None,
         "source_count": 0,
     }
-    if not folder.exists():
+    if folder is None or not folder.exists():
         return status
     # combined file — take the newest *_combined.csv at folder root
     combined_files = sorted(
@@ -207,6 +295,22 @@ def _scrape_status(isin):
             status["combined_rows"] = max(0, rows - 1)
         except OSError:
             pass
+    # main_realtime file — same pattern
+    realtime_files = sorted(
+        folder.glob("*_main_realtime.csv"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if realtime_files:
+        rf = realtime_files[0]
+        status["realtime_exists"] = True
+        status["realtime_name"] = rf.name
+        try:
+            with rf.open() as fp:
+                rows = sum(1 for _ in fp)
+            status["realtime_rows"] = max(0, rows - 1)
+        except OSError:
+            pass
     # per-source files under sources/ (new layout) or folder root (legacy)
     sources_dir = folder / "sources"
     if sources_dir.exists():
@@ -216,7 +320,9 @@ def _scrape_status(isin):
     else:
         status["source_count"] = sum(
             1 for p in folder.glob("*.csv")
-            if p.is_file() and not p.name.endswith("_combined.csv") and p.name != "combined.csv"
+            if p.is_file() and not p.name.endswith("_combined.csv")
+            and not p.name.endswith("_main_realtime.csv")
+            and p.name != "combined.csv"
         )
     return status
 
@@ -224,7 +330,9 @@ def _scrape_status(isin):
 def list_companies():
     with db() as c:
         rows = c.execute(
-            "SELECT isin, display_name, slugs_json, updated_at FROM companies ORDER BY display_name"
+            "SELECT isin, display_name, slugs_json, updated_at, "
+            "auto_scrape, auto_scrape_last_run "
+            "FROM companies ORDER BY display_name"
         ).fetchall()
         out = []
         for r in rows:
@@ -239,7 +347,11 @@ def list_companies():
                 "combined_rows": status["combined_rows"],
                 "combined_name": status["combined_name"],
                 "combined_mtime": status["combined_mtime"],
+                "realtime_rows": status["realtime_rows"],
+                "realtime_name": status["realtime_name"],
                 "source_count": status["source_count"],
+                "auto_scrape": bool(r["auto_scrape"]),
+                "auto_scrape_last_run": r["auto_scrape_last_run"],
             })
     return out
 
@@ -303,6 +415,56 @@ def get_excluded(isin):
         return json.loads(row["excluded_json"] or "[]")
     except (TypeError, ValueError):
         return []
+
+
+def set_auto_scrape(isin, enabled):
+    """Flip the auto_scrape flag for one company. Refuses if the company has
+    no configured slugs — otherwise the scheduler would churn forever on a
+    company it can't actually scrape."""
+    with db() as c:
+        row = c.execute(
+            "SELECT slugs_json FROM companies WHERE isin=?", (isin,)
+        ).fetchone()
+        if not row:
+            abort(404)
+        slugs = json.loads(row["slugs_json"] or "{}")
+        if enabled and not any(v for v in slugs.values()):
+            abort(400, "Configure at least one source slug before enabling auto-scrape.")
+        c.execute(
+            "UPDATE companies SET auto_scrape=?, updated_at=datetime('now') WHERE isin=?",
+            (1 if enabled else 0, isin),
+        )
+        c.commit()
+    return bool(enabled)
+
+
+def auto_scrape_targets():
+    """Return every company marked for auto-scrape, with slugs + exclusions
+    ready for scrape_prices.scrape()."""
+    with db() as c:
+        rows = c.execute(
+            "SELECT isin, display_name, slugs_json, excluded_json, "
+            "auto_scrape_last_run FROM companies WHERE auto_scrape=1 "
+            "ORDER BY display_name"
+        ).fetchall()
+    out = []
+    for r in rows:
+        try:
+            slugs = json.loads(r["slugs_json"] or "{}")
+        except (TypeError, ValueError):
+            slugs = {}
+        try:
+            excluded = json.loads(r["excluded_json"] or "[]")
+        except (TypeError, ValueError):
+            excluded = []
+        out.append({
+            "isin": r["isin"],
+            "display_name": r["display_name"],
+            "slugs": {k: v for k, v in slugs.items() if v},
+            "excluded": excluded,
+            "auto_scrape_last_run": r["auto_scrape_last_run"],
+        })
+    return out
 
 
 def set_excluded(isin, source, included):
@@ -419,10 +581,27 @@ def _save_index(source, rows):
     return len(rows)
 
 
+def _record_index_meta(source, count, duration_ms, error):
+    """Upsert cache metadata so the UI can show last-refreshed / errors."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with db() as c:
+        c.execute(
+            """INSERT INTO source_index_meta(source, count, last_refreshed, last_duration_ms, last_error)
+               VALUES(?,?,?,?,?)
+               ON CONFLICT(source) DO UPDATE SET
+                 count=excluded.count,
+                 last_refreshed=excluded.last_refreshed,
+                 last_duration_ms=excluded.last_duration_ms,
+                 last_error=excluded.last_error""",
+            (source, count, now, duration_ms, error),
+        )
+        c.commit()
+
+
 def _fetch(url, timeout=30, retries=2):
     for i in range(retries + 1):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=timeout)
+            r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
             r.raise_for_status()
             return r
         except Exception:
@@ -431,30 +610,95 @@ def _fetch(url, timeout=30, retries=2):
             time.sleep(1 + i)
 
 
+# XML namespace used by every sitemap file we touch.
+_SM_NS = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
+
+
+def _parse_sitemap_locs(text: str) -> tuple[list[str], bool]:
+    """Parse a sitemap payload and return (list of <loc> URLs, is_index).
+    Falls back to regex if the XML is malformed."""
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        locs = re.findall(r"<loc>([^<]+)</loc>", text)
+        is_index = "<sitemapindex" in text
+        return locs, is_index
+    tag = root.tag.lower()
+    is_index = tag.endswith("sitemapindex")
+    locs = [
+        (e.text or "").strip()
+        for e in root.iter(f"{_SM_NS}loc")
+    ] or [
+        (e.text or "").strip()
+        for e in root.iter("loc")
+    ]
+    return [u for u in locs if u], is_index
+
+
+def _fetch_sitemap_urls(entry_url: str, max_children: int = 12, timeout: int = 45) -> list[str]:
+    """Fetch an XML sitemap entry and return every `<loc>` URL in every
+    urlset it ultimately points at. If `entry_url` is a sitemap index, we
+    recurse one level into its child sitemaps. Silently skips children
+    that fail to fetch so a single bad sub-sitemap can't zero out the rest.
+    """
+    try:
+        r = _fetch(entry_url, timeout=timeout)
+    except Exception as e:
+        raise RuntimeError(f"fetch {entry_url}: {e}") from e
+    locs, is_index = _parse_sitemap_locs(r.text)
+    if not is_index:
+        return locs
+    # Sitemap index → recurse into each child urlset (bounded).
+    out = []
+    for child in locs[:max_children]:
+        try:
+            rc = _fetch(child, timeout=timeout)
+        except Exception:
+            continue
+        child_locs, child_is_index = _parse_sitemap_locs(rc.text)
+        if child_is_index:
+            # Nested index — take direct <loc>s only, don't recurse deeper.
+            out.extend(child_locs)
+        else:
+            out.extend(child_locs)
+    return out
+
+
+# source → (sitemap entry URL, regex over each URL string, excluded literal slugs)
 _SITEMAP_SOURCES = {
-    "planify":    ("https://www.planify.in/sitemap-research-report.xml",
-                   r"/research-report/([a-z0-9][a-z0-9\-]+)/", ()),
-    "wwipl":      ("https://wwipl.com/sitemap.xml",
-                   r"/unlisted-shares/([a-z0-9][a-z0-9\-]+)", ("", "page")),
-    "altius":     ("https://altiusinvestech.com/sitemap.xml",
-                   r"/company/([a-z0-9][a-z0-9\-]+)", ()),
-    "sharescart": ("https://www.sharescart.com/sitemap-unlisted.xml",
-                   r"/unlisted-shares/company/([a-z0-9][a-z0-9\-]+)/", ()),
+    "planify":       ("https://www.planify.in/sitemap-research-report.xml",
+                      r"/research-report/([a-z0-9][a-z0-9\-]+)/?", ()),
+    "wwipl":         ("https://wwipl.com/sitemap.xml",
+                      r"/unlisted-shares/([a-z0-9][a-z0-9\-]+)", ("", "page")),
+    "altius":        ("https://altiusinvestech.com/sitemap.xml",
+                      r"/company/([a-z0-9][a-z0-9\-]+)", ()),
+    "sharescart":    ("https://www.sharescart.com/sitemap-unlisted.xml",
+                      r"/unlisted-shares/company/([a-z0-9][a-z0-9\-]+)/?", ()),
+    # altmoneyvault publishes a sitemap INDEX with 5 child sitemaps; we only
+    # care about chart-sitemap.xml, so skip the index to avoid 4 wasted
+    # fetches (post/page/testimonial/category add 7+ minutes of latency).
+    "altmoneyvault": ("https://altmoneyvault.com/chart-sitemap.xml",
+                      r"/chart/([a-z0-9][a-z0-9\-]+)/?", ()),
 }
 
 
 def _refresh_sitemap(source):
     url, pattern, excluded = _SITEMAP_SOURCES[source]
-    r = _fetch(url, timeout=30)
-    slugs = [s for s in re.findall(pattern, r.text) if s not in excluded]
+    all_urls = _fetch_sitemap_urls(url)
+    slugs = []
+    for u in all_urls:
+        for m in re.findall(pattern, u):
+            if m not in excluded:
+                slugs.append(m)
     rows = [(s, slug_to_display(s)) for s in sorted(set(slugs))]
     return _save_index(source, rows)
 
 
-def refresh_planify():    return _refresh_sitemap("planify")
-def refresh_wwipl():      return _refresh_sitemap("wwipl")
-def refresh_altius():     return _refresh_sitemap("altius")
-def refresh_sharescart(): return _refresh_sitemap("sharescart")
+def refresh_planify():       return _refresh_sitemap("planify")
+def refresh_wwipl():         return _refresh_sitemap("wwipl")
+def refresh_altius():        return _refresh_sitemap("altius")
+def refresh_sharescart():    return _refresh_sitemap("sharescart")
+def refresh_altmoneyvault(): return _refresh_sitemap("altmoneyvault")
 
 
 def refresh_incredmoney():
@@ -471,35 +715,66 @@ def refresh_incredmoney():
     return _save_index("incredmoney", rows)
 
 
-# Unlistedzone + altmoneyvault fallback: try best-effort and silently return 0
+_UNLISTEDZONE_SEEDS = (
+    # Every single letter + digit — broad coverage.
+    list("abcdefghijklmnopqrstuvwxyz")
+    + list("0123456789")
+    # Common 2-letter prefixes based on Indian company names.
+    + ["sh", "un", "in", "ra", "ta", "bi", "na", "ko", "ma", "pa",
+       "ku", "go", "le", "fi", "he", "ch", "re", "sa", "vi", "pr",
+       "ad", "ar", "as", "ab", "ba", "da", "de", "do", "du", "ea",
+       "en", "es", "ga", "gr", "ha", "ho", "ja", "ji", "ka", "ki",
+       "li", "lo", "lu", "me", "mi", "mo", "mu", "ne", "no", "ny",
+       "oc", "od", "of", "oi", "om", "or", "os", "ov", "pe", "ph",
+       "pi", "po", "pu", "qu", "ri", "ro", "ru", "se", "si", "sk",
+       "so", "st", "su", "sw", "te", "th", "ti", "to", "tr", "tu",
+       "ul", "up", "ur", "va", "ve", "vo", "wa", "we", "wi", "wo",
+       "ya", "ye", "zo"]
+    # Keywords commonly embedded in unlisted-share slugs — catches
+    # companies whose display name starts with an uncommon letter or whose
+    # slug leads with a qualifier/suffix that live search ranks first.
+    + ["pvt", "ltd", "private", "limited", "india", "indian", "share",
+       "bank", "tech", "bio", "pharma", "cement", "steel", "fin",
+       "finance", "energy", "power", "infra", "auto", "motor", "food",
+       "paper", "chemical", "oil", "gas", "mining", "mineral", "metal",
+       "textile", "plastic", "realty", "estate", "logistics", "media",
+       "publish", "edu", "agro", "dairy", "beverage", "hotel", "resort",
+       "hospital", "health", "construction", "exim", "export", "import",
+       "electronic", "electric", "semiconductor", "pipe", "valve",
+       "cable", "bearing", "rubber", "glass", "wool", "jute", "leather",
+       "sugar", "tea", "coffee", "spice", "fruit", "vege", "seed",
+       "fertilizer", "plantation", "engineer", "trading", "invest",
+       "capital", "security", "services", "solution", "systems",
+       "global", "group", "corp", "enterprise", "industries"]
+)
+
+
 def refresh_unlistedzone():
+    """Enumerate unlistedzone's catalog via their live search endpoint.
+    The public /shares/ listing is JS-rendered and only exposes ~13 teasers,
+    so we hit the global-share-search endpoint with every letter/digit/
+    bigram/keyword in _UNLISTEDZONE_SEEDS and pool the results. ~200
+    queries, ~60s. Slugs are still routed through live search at lookup
+    time too (unlistedzone is in LIVE_SEARCH), but this cache lets us
+    export the full catalog for download."""
     try:
-        r = _fetch("https://unlistedzone.com/shares/", timeout=15)
-        slugs = re.findall(r"/shares/([a-z0-9][a-z0-9\-]+)/", r.text)
-        rows = [(s, slug_to_display(s)) for s in sorted(set(slugs))]
+        seen: dict[str, str] = {}
+        for q in _UNLISTEDZONE_SEEDS:
+            try:
+                hits = live_search_source("unlistedzone", q, limit=50)
+            except Exception:
+                continue
+            for h in hits:
+                slug = (h.get("slug") or "").strip()
+                if not slug or slug == "__live__":
+                    continue
+                seen.setdefault(slug, (h.get("display") or slug).strip())
+        if not seen:
+            return 0
+        rows = sorted(seen.items())
         return _save_index("unlistedzone", rows)
     except Exception:
         return 0
-
-
-def refresh_altmoneyvault():
-    try:
-        # Try both sitemap paths with generous timeouts.
-        for url in (
-            "https://altmoneyvault.com/page-sitemap.xml",
-            "https://altmoneyvault.com/wp-sitemap.xml",
-        ):
-            try:
-                r = _fetch(url, timeout=45)
-                slugs = re.findall(r"/chart/([a-z0-9][a-z0-9\-]+)/", r.text)
-                if slugs:
-                    rows = [(s, slug_to_display(s)) for s in sorted(set(slugs))]
-                    return _save_index("altmoneyvault", rows)
-            except Exception:
-                continue
-    except Exception:
-        pass
-    return 0
 
 
 INDEX_REFRESH = {
@@ -513,12 +788,65 @@ INDEX_REFRESH = {
 }
 
 
+def refresh_source(source: str):
+    """Run one refresh, record meta (count / duration / error). Returns a
+    dict with ok/count/error/duration_ms."""
+    fn = INDEX_REFRESH.get(source)
+    if not fn:
+        return {"source": source, "ok": False, "count": 0, "error": "unknown source"}
+    t0 = time.monotonic()
+    try:
+        n = int(fn() or 0)
+    except Exception as e:
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        # Keep old rows intact on failure; record meta so UI surfaces error.
+        with db() as c:
+            row = c.execute(
+                "SELECT COUNT(*) AS n FROM source_index WHERE source=?", (source,)
+            ).fetchone()
+        existing = row["n"] if row else 0
+        _record_index_meta(source, existing, duration_ms, str(e)[:240])
+        return {"source": source, "ok": False, "count": existing,
+                "error": str(e), "duration_ms": duration_ms}
+    duration_ms = int((time.monotonic() - t0) * 1000)
+    _record_index_meta(source, n, duration_ms, None)
+    return {"source": source, "ok": True, "count": n, "duration_ms": duration_ms}
+
+
+def refresh_all_parallel(max_workers: int = 7):
+    """Run every source's refresh concurrently. Returns a dict keyed by
+    source with ok / count / error / duration_ms."""
+    out = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(refresh_source, s): s for s in INDEX_REFRESH}
+        for fut in as_completed(futures):
+            s = futures[fut]
+            try:
+                out[s] = fut.result()
+            except Exception as e:
+                out[s] = {"source": s, "ok": False, "count": 0, "error": str(e)}
+    return out
+
+
 def index_counts():
+    """Return per-source count plus meta (last_refreshed / last_error)."""
     with db() as c:
-        rows = c.execute(
+        count_rows = c.execute(
             "SELECT source, COUNT(*) AS n FROM source_index GROUP BY source"
         ).fetchall()
-    return {r["source"]: r["n"] for r in rows}
+        meta_rows = c.execute(
+            "SELECT source, last_refreshed, last_duration_ms, last_error FROM source_index_meta"
+        ).fetchall()
+    counts = {r["source"]: r["n"] for r in count_rows}
+    meta = {
+        r["source"]: {
+            "last_refreshed": r["last_refreshed"],
+            "last_duration_ms": r["last_duration_ms"],
+            "last_error": r["last_error"],
+        }
+        for r in meta_rows
+    }
+    return counts, meta
 
 
 def search_source(source, query, limit=15):
@@ -569,6 +897,194 @@ def live_search_source(source, query, limit=15):
     return []
 
 
+# ---------------- auto-scrape scheduler ----------------
+
+_scheduler_started = False
+
+
+def _next_run_at(hour=AUTO_SCRAPE_HOUR_IST, minute=AUTO_SCRAPE_MINUTE_IST):
+    """Next UTC datetime at which the IST-based daily trigger should fire."""
+    now_ist = datetime.now(timezone.utc).astimezone(IST)
+    target = now_ist.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now_ist:
+        target += timedelta(days=1)
+    return target.astimezone(timezone.utc)
+
+
+def _all_scrape_targets():
+    """Return every company that has at least one configured slug, whether
+    or not it's flagged for auto-scrape. Same shape as auto_scrape_targets()
+    so _run_scrape_batch() can process both kinds."""
+    with db() as c:
+        rows = c.execute(
+            "SELECT isin, display_name, slugs_json, excluded_json, "
+            "auto_scrape_last_run FROM companies ORDER BY display_name"
+        ).fetchall()
+    out = []
+    for r in rows:
+        try:
+            slugs = {k: v for k, v in json.loads(r["slugs_json"] or "{}").items() if v}
+        except (TypeError, ValueError):
+            slugs = {}
+        if not slugs:
+            continue  # nothing to scrape
+        try:
+            excluded = json.loads(r["excluded_json"] or "[]")
+        except (TypeError, ValueError):
+            excluded = []
+        out.append({
+            "isin": r["isin"],
+            "display_name": r["display_name"],
+            "slugs": slugs,
+            "excluded": excluded,
+            "auto_scrape_last_run": r["auto_scrape_last_run"],
+        })
+    return out
+
+
+def _run_scrape_batch(
+    targets, *, label="scrape-all", bump_last_run=True, incremental=False,
+):
+    """Sequentially scrape every company in `targets`. Returns a dict with
+    ran / results.
+
+    `incremental=False` (default): calls scrape_prices.scrape(), which
+    replaces every per-source CSV with freshly-fetched data and rebuilds
+    combined + main_realtime from scratch. Used by the manual
+    'Run all now' and 'Scrape ALL' buttons.
+
+    `incremental=True`: calls scrape_prices.scrape_incremental(), which
+    keeps existing per-source rows and only appends rows on dates not
+    already on disk. Used by the daily scheduler at 09:30 IST.
+    """
+    if not targets:
+        print(f"[{label}] no targets — skipping.")
+        return {"ran": 0, "results": [], "mode": "incremental" if incremental else "full"}
+    mode = "incremental" if incremental else "full"
+    scraper_fn = scrape_prices.scrape_incremental if incremental else scrape_prices.scrape
+    print(f"[{label}] starting for {len(targets)} companies (mode={mode})")
+    results = []
+    for t in targets:
+        if not t["slugs"]:
+            print(f"[{label}]   {t['isin']}: no slugs configured, skipping")
+            results.append({"isin": t["isin"], "ok": False, "error": "no slugs"})
+            continue
+        try:
+            summary = scraper_fn(
+                t["isin"], t["slugs"],
+                excluded=t["excluded"],
+                company_name=t["display_name"],
+            )
+            files = summary.get("files") or {}
+            results.append({
+                "isin": t["isin"],
+                "display_name": t["display_name"],
+                "ok": True,
+                "combined_total": summary.get("combined_total"),
+                "realtime_rows": files.get("realtime_rows"),
+                "combined_name": files.get("combined_name"),
+                "realtime_name": files.get("realtime_name"),
+                "mode": summary.get("mode", mode),
+            })
+        except Exception as e:
+            print(f"[{label}]   {t['isin']}: FAILED — {e}")
+            results.append({
+                "isin": t["isin"], "display_name": t["display_name"],
+                "ok": False, "error": str(e),
+            })
+        if bump_last_run:
+            try:
+                with db() as c:
+                    c.execute(
+                        "UPDATE companies SET auto_scrape_last_run=? WHERE isin=?",
+                        (datetime.now(timezone.utc).isoformat(timespec="seconds"), t["isin"]),
+                    )
+                    c.commit()
+            except Exception:
+                pass
+    ok = sum(1 for r in results if r.get("ok"))
+    print(f"[{label}] done — {ok}/{len(results)} succeeded (mode={mode})")
+    return {"ran": len(results), "ok": ok, "results": results, "mode": mode}
+
+
+def _auto_scrape_pass_scheduled():
+    """Daily scheduler pass — INCREMENTAL. Appends only new dates to each
+    per-source CSV, preserves existing history even if upstream reports
+    retroactive corrections. Then rebuilds combined + main_realtime."""
+    return _run_scrape_batch(
+        auto_scrape_targets(),
+        label="auto-scrape-scheduled",
+        bump_last_run=True,
+        incremental=True,
+    )
+
+
+def _auto_scrape_pass():
+    """Manual 'Run all now' button — FULL REPLACE. Re-fetches every
+    source's full history and overwrites the per-source CSVs from scratch.
+    Used to recover when the scheduler has accumulated bad incremental
+    data."""
+    return _run_scrape_batch(
+        auto_scrape_targets(),
+        label="auto-scrape-run-now",
+        bump_last_run=True,
+        incremental=False,
+    )
+
+
+def _scrape_all_pass():
+    """'Scrape ALL N configured companies' home-page button — FULL
+    REPLACE. Runs against every company with at least one slug, not just
+    those flagged for auto-scrape. Writes both combined and main_realtime
+    CSVs for each."""
+    return _run_scrape_batch(
+        _all_scrape_targets(),
+        label="scrape-all",
+        bump_last_run=True,
+        incremental=False,
+    )
+
+
+def _auto_scrape_loop():
+    """Daemon loop: sleep until next 09:30 IST, run a pass, repeat."""
+    while True:
+        try:
+            next_at = _next_run_at()
+            sleep_s = max(1.0, (next_at - datetime.now(timezone.utc)).total_seconds())
+            print(
+                f"[auto-scrape] next run at {next_at.astimezone(IST).strftime('%Y-%m-%d %H:%M IST')} "
+                f"(sleeping {int(sleep_s)}s)"
+            )
+            time.sleep(sleep_s)
+            # Scheduler uses the incremental path — only new dates are
+            # appended, existing history is preserved. The manual
+            # 'Run all now' button still goes through _auto_scrape_pass()
+            # (full replace).
+            _auto_scrape_pass_scheduled()
+        except Exception as e:
+            # Never let the daemon die — log and keep going.
+            print(f"[auto-scrape] loop error: {e}", file=sys.stderr)
+            time.sleep(60)
+
+
+def start_auto_scrape_thread():
+    """Spawn the daemon once. No-op if DISABLE_AUTO_SCRAPE is set (tests)
+    or if already started. Safe under debug=False (no reloader subprocess)."""
+    global _scheduler_started
+    if _scheduler_started:
+        return
+    if os.environ.get("DISABLE_AUTO_SCRAPE"):
+        print("[auto-scrape] DISABLE_AUTO_SCRAPE set — scheduler not started.")
+        return
+    t = threading.Thread(target=_auto_scrape_loop, name="auto-scrape", daemon=True)
+    t.start()
+    _scheduler_started = True
+    print(
+        f"[auto-scrape] scheduler started — daily at "
+        f"{AUTO_SCRAPE_HOUR_IST:02d}:{AUTO_SCRAPE_MINUTE_IST:02d} IST"
+    )
+
+
 # ---------------- Flask app ----------------
 
 app = Flask(__name__, template_folder=str(HERE / "templates"))
@@ -577,11 +1093,17 @@ app = Flask(__name__, template_folder=str(HERE / "templates"))
 @app.route("/")
 def home():
     companies = list_companies()
+    auto_scrape_companies = [c for c in companies if c.get("auto_scrape")]
+    counts, meta = index_counts()
     return render_template(
         "index.html",
         view="home",
         companies=companies,
-        index_counts=index_counts(),
+        auto_scrape_companies=auto_scrape_companies,
+        auto_scrape_time=f"{AUTO_SCRAPE_HOUR_IST:02d}:{AUTO_SCRAPE_MINUTE_IST:02d} IST",
+        index_counts=counts,
+        index_meta=meta,
+        live_search=LIVE_SEARCH,
         sources=SOURCES,
         auto_sources=AUTO_SOURCES,
     )
@@ -604,15 +1126,19 @@ def view_company(isin):
         src: source_page_url(src, company["slugs"].get(src, ""))
         for src in SOURCES
     }
+    counts, meta = index_counts()
     return render_template(
         "index.html",
         view="company",
         company=company,
+        configured_sources=sum(1 for v in company["slugs"].values() if v),
+        auto_scrape_time=f"{AUTO_SCRAPE_HOUR_IST:02d}:{AUTO_SCRAPE_MINUTE_IST:02d} IST",
         sources=SOURCES,
         auto_sources=searchable_sources,  # both cached + live
         live_search=LIVE_SEARCH,
         manual_search_url=MANUAL_SEARCH_URL,
-        index_counts=index_counts(),
+        index_counts=counts,
+        index_meta=meta,
         source_urls=source_urls,
     )
 
@@ -662,10 +1188,18 @@ def run_scraper(isin):
         )
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-    combined_name = summary.get("files", {}).get("combined_name") or pathlib.Path(
+    files = summary.get("files", {}) or {}
+    combined_name = files.get("combined_name") or pathlib.Path(
         summary.get("combined") or ""
     ).name or "combined.csv"
     summary["combined_url"] = url_for("download_file", isin=isin, name=combined_name)
+    realtime_name = files.get("realtime_name")
+    if realtime_name:
+        summary["realtime_url"] = url_for(
+            "download_file", isin=isin, name=realtime_name
+        )
+        summary["realtime_name"] = realtime_name
+        summary["realtime_rows"] = files.get("realtime_rows")
     summary["source_urls"] = {
         src: url_for("download_file", isin=isin, name=f"sources/{src}.csv")
         for src in sources
@@ -690,14 +1224,14 @@ def audit_company(isin):
 
 @app.route("/company/<isin>/reveal", methods=["POST"])
 def reveal_folder(isin):
-    """Open the extracted/{ISIN}/ folder in the OS file manager
+    """Open the extracted/{ISIN}_{Name}/ folder in the OS file manager
     (Finder on macOS, Explorer on Windows, xdg-open on Linux)."""
     isin = isin.upper()
     company = get_company(isin)
     if not company:
         abort(404)
-    folder = EXTRACTED_DIR / isin
-    if not folder.exists():
+    folder = scrape_prices._find_extracted_folder(isin)
+    if folder is None or not folder.exists():
         return jsonify({"ok": False, "error": "Folder not created yet — run the scraper first."}), 404
     folder_str = str(folder)
     try:
@@ -735,6 +1269,11 @@ def rebuild_combined_route(isin):
             pass
         combined_name = rebuild.get("combined_name") or pathlib.Path(rebuild["combined"]).name
         rebuild["combined_url"] = url_for("download_file", isin=isin, name=combined_name)
+        realtime_name = rebuild.get("realtime_name")
+        if realtime_name:
+            rebuild["realtime_url"] = url_for(
+                "download_file", isin=isin, name=realtime_name
+            )
         return jsonify({"ok": True, "rebuild": rebuild})
     except FileNotFoundError:
         return jsonify({"ok": False, "error": "No scraped data yet — run the scraper first."}), 404
@@ -768,9 +1307,309 @@ def update_exclude(isin):
     return jsonify({"ok": True, "excluded": excluded, "rebuild": rebuild})
 
 
+@app.route("/company/<isin>/auto-scrape", methods=["POST"])
+def toggle_auto_scrape(isin):
+    isin = isin.upper()
+    if not get_company(isin):
+        abort(404)
+    raw = (request.form.get("enabled") or "").lower()
+    enabled = raw in ("true", "1", "on", "yes")
+    flag = set_auto_scrape(isin, enabled)
+    return jsonify({"ok": True, "isin": isin, "auto_scrape": flag})
+
+
+@app.route("/admin/auto-scrape")
+def list_auto_scrape():
+    """JSON list of flagged companies — for the home-page panel."""
+    targets = auto_scrape_targets()
+    # Enrich with configured-source counts so the UI can label each row.
+    for t in targets:
+        t["configured_sources"] = sum(1 for v in t["slugs"].values() if v)
+        # Don't ship the raw slugs dict to the browser — not needed here.
+        t.pop("slugs", None)
+    return jsonify({"ok": True, "companies": targets})
+
+
+@app.route("/admin/auto-scrape/run-now", methods=["POST"])
+def run_auto_scrape_now():
+    """Trigger one pass of the scheduler synchronously. Blocks until done."""
+    try:
+        result = _auto_scrape_pass()
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/admin/scrape-all", methods=["POST"])
+def run_scrape_all():
+    """Scrape every company that has at least one configured slug. Writes
+    both {ISIN}_..._combined.csv AND {ISIN}_..._main_realtime.csv per
+    company. Blocks until done — may take several minutes."""
+    try:
+        result = _scrape_all_pass()
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/discover")
+def discover_page():
+    """Catalog download page — shows each source with its cached company
+    count and a download-CSV button. Nothing else. To refresh counts use
+    the home-page '↻ Refresh all (parallel)' button."""
+    counts, meta = index_counts()
+    return render_template(
+        "index.html",
+        view="discover",
+        sources=SOURCES,
+        index_counts=counts,
+        index_meta=meta,
+        live_search=LIVE_SEARCH,
+    )
+
+
+def _source_catalog_rows(source: str) -> list[tuple[str, str, str]]:
+    """Return every (slug, display, source_page_url) tuple for a source,
+    sorted by display name. Used to build the list.csv download."""
+    with db() as c:
+        rows = c.execute(
+            "SELECT slug, display FROM source_index "
+            "WHERE source=? AND slug != '__live__' "
+            "ORDER BY display COLLATE NOCASE, slug",
+            (source,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        out.append((r["slug"], r["display"], source_page_url(source, r["slug"]) or ""))
+    return out
+
+
+@app.route("/admin/sources/<source>/list.csv")
+def source_catalog_download(source):
+    """Stream the cached company list for one source as a CSV:
+        slug,display,url"""
+    if source not in SOURCES:
+        abort(404)
+    rows = _source_catalog_rows(source)
+    from io import StringIO
+    buf = StringIO()
+    w = csv.writer(buf)
+    w.writerow(["slug", "display", "url"])
+    for slug, display, url in rows:
+        w.writerow([slug, display, url])
+    payload = buf.getvalue().encode("utf-8")
+    from flask import Response
+    return Response(
+        payload,
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{source}-companies.csv"'
+        },
+    )
+
+
+@app.route("/company-data")
+def company_data_page():
+    """Index page of company metadata (ISIN / CIN / RTA / face value / etc.).
+    Editable inline; includes a 'Check' button to cross-validate every
+    registered value against what the source pages report."""
+    with db() as c:
+        rows = c.execute(
+            "SELECT * FROM companies ORDER BY display_name"
+        ).fetchall()
+    aliases_by_isin: dict[str, list[str]] = {}
+    with db() as c:
+        for r in c.execute("SELECT isin, alias FROM aliases"):
+            aliases_by_isin.setdefault(r["isin"], []).append(r["alias"])
+    companies = [
+        company_row_to_dict(r, aliases_by_isin.get(r["isin"], []))
+        for r in rows
+    ]
+    return render_template(
+        "index.html",
+        view="company_data",
+        companies=companies,
+        sources=SOURCES,
+        data_fields=COMPANY_DATA_FIELDS,
+    )
+
+
+@app.route("/admin/company-data/download.csv")
+def download_company_data_csv():
+    """Export the /company-data table as a CSV. Columns match the on-page
+    table exactly: ISIN, Company, CIN, RTA, Face Value, Incorporated On,
+    PAN, Updated At."""
+    with db() as c:
+        rows = c.execute(
+            "SELECT isin, display_name, cin, rta, face_value, "
+            "incorporated_on, pan, updated_at "
+            "FROM companies ORDER BY display_name"
+        ).fetchall()
+    from io import StringIO
+    buf = StringIO()
+    w = csv.writer(buf)
+    w.writerow(["ISIN", "Company", "CIN", "RTA", "Face Value",
+                "Incorporated On", "PAN", "Updated At"])
+    for r in rows:
+        w.writerow([
+            r["isin"], r["display_name"],
+            r["cin"] or "", r["rta"] or "", r["face_value"] or "",
+            r["incorporated_on"] or "", r["pan"] or "",
+            r["updated_at"] or "",
+        ])
+    payload = buf.getvalue().encode("utf-8")
+    from flask import Response
+    return Response(
+        payload,
+        mimetype="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="company-data.csv"'},
+    )
+
+
+@app.route("/company/<isin>/data", methods=["POST"])
+def update_company_data(isin):
+    """Save the editable metadata fields for one company."""
+    isin = isin.upper()
+    if not get_company(isin):
+        abort(404)
+    fields = {k: request.form.get(k, "") for k in COMPANY_DATA_FIELDS}
+    res = set_company_data(isin, fields)
+    return jsonify(res)
+
+
+@app.route("/admin/check-company-data", methods=["POST"])
+def check_company_data_route():
+    """Cross-validate every registered company's CIN / RTA / face value / etc.
+    against what the source pages publish. Returns a matrix by company
+    and source."""
+    import check_company_data
+    try:
+        res = check_company_data.run_all()
+        return jsonify({"ok": True, **res})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/admin/extract-company-data", methods=["POST"])
+def extract_company_data_route():
+    """Fetch every source page for every configured company, extract every
+    detectable field (CIN / RTA / face value / industry / website /
+    incorporation date / registered office / PAN), and fill the companies
+    table with the value that >=2 sources agree on (majority vote).
+
+    Form field `overwrite=true` replaces existing values; default behaviour
+    only fills empty cells.
+    Form field `isin=INE…` narrows to a single company.
+    """
+    import check_company_data
+    overwrite = (request.form.get("overwrite", "false").lower()
+                 in ("true", "1", "on", "yes"))
+    isin = (request.form.get("isin") or "").strip().upper() or None
+    try:
+        res = check_company_data.extract_and_consolidate(
+            overwrite=overwrite, isin_filter=isin,
+        )
+        return jsonify({"ok": True, **res})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/isin-check")
+def isin_check_page():
+    """Dedicated ISIN validator page — per-source ISIN matrix + match counts."""
+    return render_template(
+        "index.html",
+        view="isin_check",
+        sources=SOURCES,
+    )
+
+
+@app.route("/admin/check-isins", methods=["POST"])
+def run_isin_check():
+    """Blocking ISIN check across every registered (company, source) pair.
+    Returns the full result as JSON — takes ~45-60s for the full set."""
+    import check_isins
+    source_filter = request.form.get("source") or None
+    isin_filter = (request.form.get("isin") or "").strip().upper() or None
+    try:
+        res = check_isins.run_all(
+            isin_filter=isin_filter,
+            source_filter=source_filter,
+        )
+        # Persist both CSV shapes + JSON snapshot so the /isin-check page
+        # can rehydrate on load without re-running the check.
+        check_isins.write_csv(res, HERE / "isin_check.csv")
+        check_isins.write_matrix_csv(res, HERE / "isin_check_matrix.csv")
+        check_isins.write_json(res, HERE / "isin_check.json")
+        # Include the generated_at stamp in the response too
+        from datetime import datetime, timezone
+        return jsonify({
+            "ok": True,
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            **res,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/admin/check-isins/latest")
+def latest_isin_check():
+    """Return the most recent saved check result, or 404 if none exists.
+    The /isin-check page calls this on load — no fetching is done unless
+    the user explicitly clicks 'Run check'."""
+    import check_isins
+    data = check_isins.read_json(HERE / "isin_check.json")
+    if data is None:
+        return jsonify({"ok": False, "error": "no saved check yet"}), 404
+    return jsonify({"ok": True, **data})
+
+
+@app.route("/admin/check-isins/download.csv")
+def download_isin_check_csv():
+    """Long CSV — one row per (company × source) pair."""
+    path = HERE / "isin_check.csv"
+    if not path.exists():
+        abort(404, "no ISIN check has been run yet")
+    return send_from_directory(HERE, "isin_check.csv", as_attachment=True)
+
+
+@app.route("/admin/check-isins/download-matrix.csv")
+def download_isin_check_matrix_csv():
+    """Wide CSV matching the /isin-check UI — one row per company, one
+    column per source. Includes the same `Match` N/M score column."""
+    path = HERE / "isin_check_matrix.csv"
+    if not path.exists():
+        abort(404, "no ISIN check has been run yet")
+    return send_from_directory(HERE, "isin_check_matrix.csv", as_attachment=True)
+
+
+@app.route("/admin/sources/all/list.csv")
+def all_catalogs_download():
+    """Combined CSV across every source — source,slug,display,url."""
+    from io import StringIO
+    buf = StringIO()
+    w = csv.writer(buf)
+    w.writerow(["source", "slug", "display", "url"])
+    for src in SOURCES:
+        for slug, display, url in _source_catalog_rows(src):
+            w.writerow([src, slug, display, url])
+    payload = buf.getvalue().encode("utf-8")
+    from flask import Response
+    return Response(
+        payload,
+        mimetype="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="all-sources-companies.csv"'},
+    )
+
+
 @app.route("/extracted/<isin>/<path:name>")
 def download_file(isin, name):
-    folder = EXTRACTED_DIR / isin.upper()
+    """Serve a file inside the extracted/{ISIN}_{Name}/ folder. The
+    URL still takes just the ISIN — we resolve the actual folder on disk
+    (which may include a company-name suffix)."""
+    folder = scrape_prices._find_extracted_folder(isin.upper())
+    if folder is None:
+        abort(404)
     path = folder / name
     # Resolve and make sure it still lives under the ISIN folder (no ../ escapes).
     try:
@@ -790,28 +1629,33 @@ def source_search(source):
 
 @app.route("/admin/refresh-index/<source>", methods=["POST"])
 def refresh_index(source):
-    fn = INDEX_REFRESH.get(source)
-    if not fn:
+    if source not in INDEX_REFRESH:
         abort(404)
-    try:
-        n = fn()
-        return jsonify({"ok": True, "source": source, "count": n})
-    except Exception as e:
-        return jsonify({"ok": False, "source": source, "error": str(e)}), 500
+    result = refresh_source(source)
+    status = 200 if result.get("ok") else 500
+    return jsonify(result), status
 
 
 @app.route("/admin/refresh-all", methods=["POST"])
 def refresh_all():
-    out = {}
-    for name, fn in INDEX_REFRESH.items():
-        try:
-            out[name] = fn()
-        except Exception as e:
-            out[name] = f"FAIL: {e}"
-    return jsonify(out)
+    """Refresh every source's index in parallel. Returns per-source status
+    plus meta so the UI can render pill colors + tooltips in one pass."""
+    t0 = time.monotonic()
+    results = refresh_all_parallel()
+    total_ms = int((time.monotonic() - t0) * 1000)
+    ok_count = sum(1 for r in results.values() if r.get("ok"))
+    return jsonify({
+        "ok": ok_count == len(results),
+        "ok_count": ok_count,
+        "total": len(results),
+        "duration_ms": total_ms,
+        "results": results,
+    })
 
 
 if __name__ == "__main__":
     init_db()
+    # debug=False below → no reloader subprocess, so the daemon spawns once.
+    start_auto_scrape_thread()
     print(f"Admin panel → http://127.0.0.1:8765")
     app.run(host="127.0.0.1", port=8765, debug=False)
