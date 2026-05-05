@@ -34,11 +34,12 @@ import json
 import pathlib
 import random
 import re
+import shutil
 import sys
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 from bs4 import BeautifulSoup
@@ -63,12 +64,12 @@ HEADERS = {
 CSV_HEADER = ["Datetime", "Price", "Source", "Tag", "Note", "Link"]
 
 
-def _get(url, *, timeout=30, retries=2, **kw):
-    """GET with exponential backoff retry."""
+def _request(method: str, url: str, *, timeout=30, retries=2, **kw):
+    """HTTP request with exponential backoff retry. Shared by _get / _post."""
     headers = {**HEADERS, **kw.pop("headers", {})}
     for i in range(retries + 1):
         try:
-            r = requests.get(url, headers=headers, timeout=timeout, **kw)
+            r = requests.request(method, url, headers=headers, timeout=timeout, **kw)
             r.raise_for_status()
             return r
         except Exception:
@@ -77,18 +78,12 @@ def _get(url, *, timeout=30, retries=2, **kw):
             time.sleep(1 + i)
 
 
-def _post(url, *, timeout=30, retries=2, **kw):
-    """POST with exponential backoff retry."""
-    headers = {**HEADERS, **kw.pop("headers", {})}
-    for i in range(retries + 1):
-        try:
-            r = requests.post(url, headers=headers, timeout=timeout, **kw)
-            r.raise_for_status()
-            return r
-        except Exception:
-            if i == retries:
-                raise
-            time.sleep(1 + i)
+def _get(url, **kw):
+    return _request("GET", url, **kw)
+
+
+def _post(url, **kw):
+    return _request("POST", url, **kw)
 
 
 # Accept either a bare slug or a full URL in the slug field. Each entry
@@ -461,13 +456,13 @@ def _migrate_extracted_folder(isin: str, company_name: str) -> pathlib.Path:
                     try:
                         if child.stat().st_mtime > dest.stat().st_mtime:
                             if dest.is_dir():
-                                import shutil as _sh; _sh.rmtree(dest)
+                                shutil.rmtree(dest)
                             else:
                                 dest.unlink()
                             child.replace(dest)
                         else:
                             if child.is_dir():
-                                import shutil as _sh; _sh.rmtree(child)
+                                shutil.rmtree(child)
                             else:
                                 child.unlink()
                     except OSError:
@@ -554,6 +549,26 @@ def _pick_median_row(rows: list) -> tuple:
     """Upper-middle row of a list sorted by price ascending."""
     rows = sorted(rows, key=lambda r: float(r[1]))
     return rows[len(rows) // 2]
+
+
+def _aggregate_to_mean(rows: list) -> tuple:
+    """Build a synthetic row whose price is the arithmetic mean of every
+    input row's price. The synthetic row's metadata records how many
+    sources contributed (comma-joined source names in the Source column,
+    note field left empty so downstream chart filters stay clean).
+    Single-row input is returned unchanged so we don't lose any source-
+    specific note/link metadata.
+    """
+    if not rows:
+        raise ValueError("_aggregate_to_mean: no rows")
+    if len(rows) == 1:
+        return rows[0]
+    prices = [float(r[1]) for r in rows]
+    avg = sum(prices) / len(prices)
+    sources = ",".join(sorted({r[2] for r in rows if r[2]}))
+    # Use the first row's datetime — _ist_times_for() will reassign per-day
+    # timestamps anyway when the combined CSV is rendered.
+    return (rows[0][0], avg, sources or "consensus", "", "", "")
 
 
 # Auto-exclude a source whose prices deviate > this ratio from the cross-source
@@ -687,9 +702,8 @@ def _recent_fresh_anchor(
         y, mo, d = (int(x) for x in cutoff_date.split("-"))
     except (ValueError, TypeError):
         return None
-    from datetime import date as _date, timedelta as _td
-    end = _date(y, mo, d)
-    start = (end - _td(days=window_days)).isoformat()
+    end = date(y, mo, d)
+    start = (end - timedelta(days=window_days)).isoformat()
     fresh: list[float] = []
     for r in rows:
         if r[3]:
@@ -789,15 +803,24 @@ def _median_per_day(rows: list) -> list:
     for (date_key, _src), r in by_date_src.items():
         by_date[date_key].append(r)
 
-    # Step 2: per-day outlier rejection + freshness-aware median.
-    # We track FRESH survivors (not just total) — days where every surviving
-    # source is stale are effectively single-source data and should trigger
-    # the step guard, even if N sources reported. Example: Hindustan Engg
-    # with incredmoney stuck at 1699 and unlistedzone stuck at 1050 (both
-    # stale): upper-middle would oscillate to 1699; instead we tiebreak
-    # using a recent-fresh anchor across all sources so the closer stale
-    # survivor wins, and the step guard can still carry forward where
-    # appropriate.
+    # Step 2: per-day MEAN aggregation with the same outlier / freshness
+    # protections we applied before. The chart-ready price for each day is
+    # now the arithmetic mean of the *surviving fresh* sources — picking a
+    # single source's row tended to amplify their per-source biases (e.g.
+    # incredmoney's stuck-at-1699 anchoring Hindustan Engg's chart). Mean
+    # smooths across providers so a single outlier source no longer wins
+    # the day. Order of operations:
+    #   1. Drop suspects + pin rows (steps 0a + 1, already done).
+    #   2. If ≥3 sources today, drop any whose price deviates >40% from
+    #      the naive median (kills wild-disagreement glitches before the
+    #      mean is taken — otherwise one bad source skews the average).
+    #   3. Prefer fresh sources: if any fresh survivor exists, take the
+    #      mean of fresh-only. Stale sources are dropped.
+    #   4. If every survivor is stale: pick the survivor closest to the
+    #      recent-fresh anchor (single row, NOT mean — averaging two
+    #      stale-but-divergent values gives a value neither was reporting).
+    #   5. Single survivor: return it unchanged so per-source metadata is
+    #      preserved.
     per_day = []  # list of (date_key, chosen_row, fresh_survivor_count)
     for date_key in sorted(by_date):
         group = by_date[date_key]
@@ -812,16 +835,33 @@ def _median_per_day(rows: list) -> list:
                 ]
                 if filtered:
                     survivors = filtered
-        fresh = sum(1 for r in survivors if (r[2], r[0][:10]) not in stale_keys)
-        # All-stale tiebreak: pick the survivor closest to the recent
-        # fresh anchor across all sources.
-        if fresh == 0 and len(survivors) >= 2:
+        fresh_rows = [r for r in survivors if (r[2], r[0][:10]) not in stale_keys]
+        fresh = len(fresh_rows)
+        if fresh_rows:
+            # Mean of every fresh source — drops stale entirely.
+            chosen = _aggregate_to_mean(fresh_rows)
+        else:
+            # Every survivor is stale (or only a single stale survivor exists).
+            # Use the recent-fresh anchor (median of fresh prices in the last
+            # 30 days across ALL sources) when available — this prevents days
+            # with only frozen stale sources from publishing a stuck-forever
+            # value. Example: Bootes Impex with only unlistedzone=1195 stuck
+            # for 21 days — emit the anchor (~1500-1700) instead of 1195.
             anchor = _recent_fresh_anchor(rows, stale_keys, date_key)
             if anchor is not None and anchor > 0:
-                chosen = min(survivors, key=lambda r: abs(float(r[1]) - anchor))
-                per_day.append((date_key, chosen, fresh))
+                # Synthesize a row at the anchor price. Tag with [anchor] so
+                # users can audit which days were interpolated.
+                r0 = survivors[0] if survivors else (date_key + " 00:00:00", 0, "anchor", "", "", "")
+                chosen = (r0[0], anchor, "anchor", "", "[anchor]", "")
+            elif len(survivors) >= 2:
+                # No anchor — last resort, pick lower-middle of stale
+                # survivors to avoid upward bias.
+                rows_sorted = sorted(survivors, key=lambda r: float(r[1]))
+                chosen = rows_sorted[(len(rows_sorted) - 1) // 2]
+            elif survivors:
+                chosen = survivors[0]
+            else:
                 continue
-        chosen = _pick_freshness_aware_median(survivors, stale_keys)
         per_day.append((date_key, chosen, fresh))
 
     # Step 3: timeline step guard
@@ -830,10 +870,9 @@ def _median_per_day(rows: list) -> list:
     # from a trusted baseline; if we have no baseline yet (series starts
     # with single-source data) or the baseline is stale, today's value
     # passes through unchanged.
-    from datetime import date as _date
     def _parse(dk):
         y, mo, d = (int(x) for x in dk.split("-"))
-        return _date(y, mo, d)
+        return date(y, mo, d)
 
     staged = []  # [(row, n_survivors), ...] after step guard
     baseline_price = None
@@ -942,6 +981,14 @@ def _ist_times_for(rows: list) -> list:
     return out
 
 
+def _strip_notes(rows: list) -> list:
+    """Return a copy of `rows` with the note field (index 4) blanked out.
+    Used when writing main_realtime.csv — the algorithm leaves internal
+    markers like [anchor] / [carried forward] on rows for debugging, but
+    the public output file should have a clean empty note column."""
+    return [(r[0], r[1], r[2], r[3], "", r[5]) for r in rows]
+
+
 def _write_combined(path: pathlib.Path, rows: list) -> None:
     """Write the merged file in the public schema expected downstream:
         datetime,price,note,link,category
@@ -1005,23 +1052,23 @@ def _clean_stale_combined(folder: pathlib.Path, *keeps: pathlib.Path) -> None:
                 pass
 
 
-def write_outputs(isin: str, by_source: dict, excluded=(), company_name: str = "") -> dict:
-    """Layout under extracted/{ISIN}/:
-        {ISIN}_{Company_Name}_combined.csv   — merged & time-stamped output
-        sources/                             — per-source raw CSVs (debug)
-            planify.csv, unlistedzone.csv, …
-
-    The combined file is always (re)written from scratch in "w" mode, so each
-    call replaces the previous one. Any stale `*_combined.csv` from earlier
-    runs (e.g. under a different company name) is removed.
-    """
+def _persist_per_source_and_combined(
+    isin: str,
+    by_source: dict,
+    *,
+    excluded: set,
+    company_name: str,
+    log_label: str,
+) -> tuple[dict, list, list, pathlib.Path]:
+    """Write per-source CSVs, build & write combined.csv + main_realtime.csv,
+    sweep stale outputs. Returns (files dict, combined rows, realtime rows,
+    folder). Used by both write_outputs() and scrape_incremental()."""
     folder = _migrate_extracted_folder(isin, company_name)
     _migrate_flat_sources(folder)
     sources_dir = _sources_dir(folder)
     sources_dir.mkdir(parents=True, exist_ok=True)
-    excluded = set(excluded or ())
-    combined = []
-    files = {}
+    combined: list = []
+    files: dict = {}
     for source, rows in by_source.items():
         f = sources_dir / f"{source}.csv"
         _write(f, rows)
@@ -1034,18 +1081,39 @@ def write_outputs(isin: str, by_source: dict, excluded=(), company_name: str = "
     realtime_name = _main_realtime_filename(isin, company_name)
     realtime_path = folder / realtime_name
     realtime_rows = _median_per_day(combined)
-    _write_combined(realtime_path, realtime_rows)
+    _write_combined(realtime_path, _strip_notes(realtime_rows))
     _clean_stale_combined(folder, combined_path, realtime_path)
-    files["combined"] = str(combined_path)
-    files["combined_name"] = combined_name
-    files["realtime"] = str(realtime_path)
-    files["realtime_name"] = realtime_name
-    files["realtime_rows"] = len(realtime_rows)
-    files["sources_dir"] = str(sources_dir)
+    files.update({
+        "combined": str(combined_path),
+        "combined_name": combined_name,
+        "realtime": str(realtime_path),
+        "realtime_name": realtime_name,
+        "realtime_rows": len(realtime_rows),
+        "sources_dir": str(sources_dir),
+    })
     print(
-        f"{isin}: combined={len(combined)} rows, "
+        f"{isin}{log_label}: combined={len(combined)} rows, "
         f"realtime={len(realtime_rows)} rows "
         f"(excluded: {sorted(excluded) or 'none'}) -> {combined_path}"
+    )
+    return files, combined, realtime_rows, folder
+
+
+def write_outputs(isin: str, by_source: dict, excluded=(), company_name: str = "") -> dict:
+    """Layout under extracted/{ISIN}/:
+        {ISIN}_{Company_Name}_combined.csv   — merged & time-stamped output
+        sources/                             — per-source raw CSVs (debug)
+            planify.csv, unlistedzone.csv, …
+
+    The combined file is always (re)written from scratch in "w" mode, so each
+    call replaces the previous one. Any stale `*_combined.csv` from earlier
+    runs (e.g. under a different company name) is removed.
+    """
+    files, _, _, _ = _persist_per_source_and_combined(
+        isin, by_source,
+        excluded=set(excluded or ()),
+        company_name=company_name,
+        log_label="",
     )
     return files
 
@@ -1095,7 +1163,6 @@ def audit_sources(isin: str) -> dict:
         if rows:
             per_source[source] = rows
     # Build per-date median across all sources.
-    from collections import defaultdict
     per_date = defaultdict(dict)
     for src, rows in per_source.items():
         for d, p in rows.items():
@@ -1188,7 +1255,7 @@ def rebuild_combined(isin: str, excluded=(), company_name: str = "") -> dict:
     realtime_name = _main_realtime_filename(isin, company_name)
     realtime_path = folder / realtime_name
     realtime_rows = _median_per_day(combined)
-    _write_combined(realtime_path, realtime_rows)
+    _write_combined(realtime_path, _strip_notes(realtime_rows))
     _clean_stale_combined(folder, combined_path, realtime_path)
     return {
         "isin": isin,
@@ -1240,6 +1307,54 @@ def _load_existing_source_rows(folder: pathlib.Path, source: str) -> tuple[list,
     return rows, dates
 
 
+_BLOCKED_SOURCES = {"stockify", "precize", "stakehub", "unlistedideas"}
+
+
+def _build_jobs(sources: dict, counts: dict) -> dict:
+    """Pick scrapable (tag, slug) → fn entries from `sources`. Records
+    skip / unknown reasons into `counts`. Empty raw values are ignored."""
+    jobs: dict = {}
+    for tag, raw in sources.items():
+        if not raw:
+            continue
+        fn = SCRAPERS.get(tag)
+        if not fn:
+            counts[tag] = (
+                "skipped (not HTTP-scrapable)"
+                if tag in _BLOCKED_SOURCES else "unknown source"
+            )
+            continue
+        jobs[(tag, slug_from_value(tag, raw))] = fn
+    return jobs
+
+
+def _run_jobs_concurrent(jobs: dict, *, max_workers: int = 7) -> dict:
+    """Run every (tag, slug) → fn job in a thread pool. Returns
+    {tag: (rows | None, error_str | None)}."""
+    out: dict = {}
+    if not jobs:
+        return out
+    with ThreadPoolExecutor(max_workers=min(len(jobs), max_workers)) as ex:
+        futures = {
+            ex.submit(fn, slug): (tag, slug)
+            for (tag, slug), fn in jobs.items()
+        }
+        for fut in as_completed(futures):
+            tag, slug = futures[fut]
+            try:
+                out[tag] = (fut.result(), None)
+            except Exception as e:
+                print(f"  {tag}[{slug}] failed: {e}", file=sys.stderr)
+                out[tag] = (None, str(e))
+    return out
+
+
+def _print_per_source_counts(counts: dict, excluded: set) -> None:
+    for tag, c in counts.items():
+        marker = "  (excluded)" if tag in excluded else ""
+        print(f"    {tag}: {c}{marker}")
+
+
 def scrape_incremental(
     isin: str, sources: dict, excluded=(), company_name: str = ""
 ) -> dict:
@@ -1254,92 +1369,50 @@ def scrape_incremental(
     """
     folder = _migrate_extracted_folder(isin, company_name)
     _migrate_flat_sources(folder)
-    sources_dir = _sources_dir(folder)
-    sources_dir.mkdir(parents=True, exist_ok=True)
+    excluded_set = set(excluded or ())
 
-    # First, read what we already have on disk (per source)
-    existing_by_source: dict = {}
-    for src in sources:
-        existing_by_source[src] = _load_existing_source_rows(folder, src)
+    # Read what we already have on disk (per source) before fetching.
+    existing_by_source = {
+        src: _load_existing_source_rows(folder, src) for src in sources
+    }
 
     counts: dict = {}
     merged_by_source: dict = {}
-    jobs: dict = {}
-    for tag, raw in sources.items():
-        if not raw:
-            continue
-        fn = SCRAPERS.get(tag)
-        if not fn:
-            counts[tag] = "unknown source"
+    jobs = _build_jobs(sources, counts)
+    # Pre-seed merged with existing data so unknown / failed sources still
+    # roundtrip through write.
+    for tag in sources:
+        if tag not in {t for (t, _) in jobs}:
             merged_by_source[tag] = existing_by_source.get(tag, ([], set()))[0]
+
+    for tag, (fresh_rows, err) in _run_jobs_concurrent(jobs).items():
+        existing_rows, existing_dates = existing_by_source.get(tag, ([], set()))
+        if err is not None:
+            counts[tag] = f"FAIL: {err}"
+            merged_by_source[tag] = existing_rows
             continue
-        jobs[(tag, slug_from_value(tag, raw))] = fn
+        new_rows = [r for r in fresh_rows if r[0][:10] not in existing_dates]
+        merged_by_source[tag] = existing_rows + new_rows
+        counts[tag] = f"+{len(new_rows)} new (kept {len(existing_rows)})"
 
-    if jobs:
-        with ThreadPoolExecutor(max_workers=min(len(jobs), 7)) as ex:
-            futures = {
-                ex.submit(fn, slug): (tag, slug)
-                for (tag, slug), fn in jobs.items()
-            }
-            for fut in as_completed(futures):
-                tag, slug = futures[fut]
-                existing_rows, existing_dates = existing_by_source.get(tag, ([], set()))
-                try:
-                    fresh_rows = fut.result()
-                except Exception as e:
-                    counts[tag] = f"FAIL: {e}"
-                    merged_by_source[tag] = existing_rows  # keep what we had
-                    print(f"  {tag}[{slug}] failed: {e} (kept {len(existing_rows)} existing rows)", file=sys.stderr)
-                    continue
-                # Keep only rows on dates we don't already have
-                new_rows = [r for r in fresh_rows if r[0][:10] not in existing_dates]
-                merged = existing_rows + new_rows
-                merged_by_source[tag] = merged
-                counts[tag] = f"+{len(new_rows)} new (kept {len(existing_rows)})"
-
-    # Write back every per-source CSV (sorted, deduped by _write)
-    excluded = set(excluded or ())
-    combined: list = []
-    files: dict = {}
-    for source, rows in merged_by_source.items():
-        f = sources_dir / f"{source}.csv"
-        _write(f, rows)
-        files[source] = str(f)
-        if source not in excluded:
-            combined += rows
-    combined_name = _combined_filename(isin, company_name)
-    combined_path = folder / combined_name
-    _write_combined(combined_path, combined)
-    realtime_name = _main_realtime_filename(isin, company_name)
-    realtime_path = folder / realtime_name
-    realtime_rows = _median_per_day(combined)
-    _write_combined(realtime_path, realtime_rows)
-    _clean_stale_combined(folder, combined_path, realtime_path)
-
-    files["combined"] = str(combined_path)
-    files["combined_name"] = combined_name
-    files["realtime"] = str(realtime_path)
-    files["realtime_name"] = realtime_name
-    files["realtime_rows"] = len(realtime_rows)
-    files["sources_dir"] = str(sources_dir)
+    files, _, _, _ = _persist_per_source_and_combined(
+        isin, merged_by_source,
+        excluded=excluded_set,
+        company_name=company_name,
+        log_label=" (incremental)",
+    )
 
     total = sum(len(v) for v in merged_by_source.values())
     combined_total = sum(
-        len(v) for k, v in merged_by_source.items() if k not in excluded
+        len(v) for k, v in merged_by_source.items() if k not in excluded_set
     )
-    for tag, c in counts.items():
-        marker = "  (excluded)" if tag in excluded else ""
-        print(f"    {tag}: {c}{marker}")
-    print(
-        f"{isin} (incremental): combined={len(combined)} rows, "
-        f"realtime={len(realtime_rows)} rows -> {combined_path}"
-    )
+    _print_per_source_counts(counts, excluded_set)
     return {
         "isin": isin,
         "total": total,
         "combined_total": combined_total,
         "counts": counts,
-        "excluded": sorted(excluded),
+        "excluded": sorted(excluded_set),
         "files": files,
         "combined": files.get("combined"),
         "mode": "incremental",
@@ -1352,45 +1425,26 @@ def scrape(isin: str, sources: dict, excluded=(), company_name: str = "") -> dic
     `excluded`: collection of source names to omit from combined.csv (per-source
     files are still written).
     """
-    by_source = {}
-    counts = {}
-    jobs = {}  # future -> (tag, slug)
-    for tag, raw in sources.items():
-        if not raw:
-            continue
-        fn = SCRAPERS.get(tag)
-        if not fn:
-            if tag in ("stockify", "precize", "stakehub", "unlistedideas"):
-                counts[tag] = "skipped (not HTTP-scrapable)"
-            else:
-                counts[tag] = "unknown source"
-            continue
-        jobs[(tag, slug_from_value(tag, raw))] = fn
-
-    if jobs:
-        with ThreadPoolExecutor(max_workers=min(len(jobs), 7)) as ex:
-            futures = {
-                ex.submit(fn, slug): (tag, slug)
-                for (tag, slug), fn in jobs.items()
-            }
-            for fut in as_completed(futures):
-                tag, slug = futures[fut]
-                try:
-                    rows = fut.result()
-                    by_source[tag] = rows
-                    counts[tag] = len(rows)
-                except Exception as e:
-                    counts[tag] = f"FAIL: {e}"
-                    print(f"  {tag}[{slug}] failed: {e}", file=sys.stderr)
-    files = write_outputs(isin, by_source, excluded=excluded, company_name=company_name)
-    total = sum(len(v) for v in by_source.values())
     excluded_set = set(excluded or ())
+    counts: dict = {}
+    by_source: dict = {}
+    jobs = _build_jobs(sources, counts)
+
+    for tag, (rows, err) in _run_jobs_concurrent(jobs).items():
+        if err is not None:
+            counts[tag] = f"FAIL: {err}"
+            continue
+        by_source[tag] = rows
+        counts[tag] = len(rows)
+
+    files = write_outputs(
+        isin, by_source, excluded=excluded_set, company_name=company_name
+    )
+    total = sum(len(v) for v in by_source.values())
     combined_total = sum(
         len(v) for k, v in by_source.items() if k not in excluded_set
     )
-    for tag, c in counts.items():
-        marker = "  (excluded)" if tag in excluded_set else ""
-        print(f"    {tag}: {c}{marker}")
+    _print_per_source_counts(counts, excluded_set)
     return {
         "isin": isin,
         "total": total,

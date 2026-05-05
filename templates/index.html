@@ -81,7 +81,12 @@ tr:hover td { background:#1b1f28; }
 .idx-pill.ok { background:#1b2a1f; color:var(--accent2);}
 .idx-pill.empty { background:#2a1f1f; color:var(--danger);}
 hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
+#chartSourceTabs button[data-src],
+#chartRangeTabs  button[data-range] { padding:5px 10px; font-size:12px; }
 </style>
+{% if view == 'company' %}
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+{% endif %}
 </head>
 <body>
 <header>
@@ -223,9 +228,11 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
       </span>
     </h2>
     <div class="inline" style="margin-bottom:12px; gap:10px; flex-wrap:wrap;">
-      <button class="primary" id="scrapeAllBtn" onclick="scrapeAll(this)">▶ Scrape ALL {{ configured_count }} configured companies</button>
+      <button class="primary" id="updateAllBtn" onclick="updateAllPrices(this)" title="Fetch only dates not already on disk for every configured company">⟳ Update all price data</button>
+      <span id="updateAllStatus" class="muted"></span>
+      <button class="ghost" id="scrapeAllBtn" onclick="scrapeAll(this)" title="Full re-fetch — overwrites every per-source CSV from scratch">▶ Scrape ALL {{ configured_count }} configured companies</button>
       <span id="scrapeAllStatus" class="muted"></span>
-      <span class="muted" style="margin-left:auto;">Writes <code>combined.csv</code> + <code>main_realtime.csv</code> per company. Blocking — can take 10+ minutes.</span>
+      <span class="muted" style="margin-left:auto;">Update appends missing dates only · Scrape ALL re-fetches full history (10+ min).</span>
     </div>
     {% if not_scraped %}
     <div class="banner">
@@ -242,7 +249,7 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
       <button class="ghost" onclick="filterCompanies('not_scraped', this)">Not scraped</button>
     </div>
     <table id="companiesTable">
-      <thead><tr><th>ISIN</th><th>Name</th><th>Sources</th><th>Scraped?</th><th>Rows</th><th>Last scraped</th><th title="Include in daily auto-scrape (09:30 IST)">Auto</th><th></th></tr></thead>
+      <thead><tr><th>ISIN</th><th>Name</th><th>Sources</th><th>Scraped?</th><th>Rows</th><th>Last scraped</th><th title="Include in daily auto-scrape (09:30 IST)">Auto</th><th>Update</th><th></th></tr></thead>
       <tbody>
       {% for c in companies %}
       <tr data-scraped="{{ 'yes' if c.scraped else 'no' }}"
@@ -266,6 +273,15 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
                  data-isin="{{ c.isin }}"
                  onchange="toggleAutoScrapeRow(this)"
                  style="width:16px; height:16px; accent-color:var(--accent2); cursor:pointer;">
+        </td>
+        <td>
+          {% if c.configured_sources %}
+          <button class="ghost" title="Fetch only dates not already on disk"
+                  onclick="updateOneCompany('{{ c.isin }}', this)"
+                  style="padding:4px 10px; font-size:12px;">⟳ Update</button>
+          {% else %}
+          <span class="muted" style="font-size:12px;">—</span>
+          {% endif %}
         </td>
         <td><a href="{{ url_for('view_company', isin=c.isin) }}">Open →</a></td>
       </tr>
@@ -393,6 +409,36 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
   </div>
 
   <div class="panel">
+    <h2>Price chart</h2>
+    <p class="muted">
+      Visual quality check for the data going into Polemarch.
+      <strong>Realtime</strong> = the cleaned <code>main_realtime.csv</code>
+      (mean-of-fresh-sources per day, with all noise-reduction rules applied).
+      <strong>Combined</strong> = the raw <code>combined.csv</code>
+      (every per-source row, no aggregation — useful to see what each source reports).
+      Toggle <strong>Both</strong> to overlay them.
+    </p>
+    <div class="inline" style="gap:10px; flex-wrap:wrap; margin-bottom:10px; align-items:center;">
+      <div class="inline" style="gap:4px;" id="chartSourceTabs">
+        <button class="primary" data-src="realtime" onclick="cpSetSource('realtime', this)">main_realtime</button>
+        <button class="ghost"   data-src="combined" onclick="cpSetSource('combined', this)">combined</button>
+        <button class="ghost"   data-src="both"     onclick="cpSetSource('both', this)">both (overlay)</button>
+      </div>
+      <span class="muted" style="margin-left:6px;">Range:</span>
+      <div class="inline" style="gap:4px;" id="chartRangeTabs">
+        <button class="ghost" data-range="1M"  onclick="cpSetRange('1M', this)">1M</button>
+        <button class="ghost" data-range="6M"  onclick="cpSetRange('6M', this)">6M</button>
+        <button class="ghost" data-range="1Y"  onclick="cpSetRange('1Y', this)">1Y</button>
+        <button class="ghost" data-range="3Y"  onclick="cpSetRange('3Y', this)">3Y</button>
+        <button class="primary" data-range="MAX" onclick="cpSetRange('MAX', this)">MAX</button>
+      </div>
+      <span id="chartStatus" class="muted" style="margin-left:auto; font-size:11px;"></span>
+    </div>
+    <div id="priceChart" style="width:100%; height:420px; background:#0a0c11; border:1px solid var(--border); border-radius:7px;"></div>
+    <div id="chartLegend" class="muted" style="font-size:11px; margin-top:6px;"></div>
+  </div>
+
+  <div class="panel">
     <h2>Run scraper</h2>
     <p class="muted">
       Hits all configured sources and writes files under
@@ -416,7 +462,8 @@ hr { border:none; border-top:1px solid var(--border); margin:20px 0;}
       <span class="muted" style="margin-left:auto;">Last auto-run: {{ company.auto_scrape_last_run }}</span>
       {% endif %}
     </div>
-    <button class="primary" id="runBtn" onclick="runScrape()">▶ Run scraper</button>
+    <button class="primary" id="updateBtn" onclick="updatePriceData()" title="Fetch only dates not already on disk and append them">⟳ Update price data</button>
+    <button class="ghost" id="runBtn" onclick="runScrape()" style="margin-left:10px;" title="Full re-fetch — overwrites every per-source CSV from scratch">▶ Run scraper</button>
     <a id="combinedLink" class="btn" style="margin-left:10px; display:none;" href="#">⬇ Download combined.csv</a>
     <a id="realtimeLink" class="btn" style="margin-left:10px; display:none;" href="#">⬇ Download main_realtime.csv</a>
     <button class="ghost" id="rebuildBtn" style="margin-left:10px;" onclick="rebuildCombined()">↻ Regenerate combined</button>
@@ -779,6 +826,54 @@ async function runAllAutoScrape(btn) {
   }
 }
 
+async function updateAllPrices(btn) {
+  const status = document.getElementById('updateAllStatus');
+  btn.disabled = true; btn.textContent = '⏳ Updating…';
+  if (status) status.textContent = 'Fetching missing dates only — existing rows preserved.';
+  try {
+    const r = await fetch('/admin/update-all', {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      if (status) status.textContent = 'Error: ' + (j.error || 'unknown');
+      btn.disabled = false; btn.textContent = '⟳ Update all price data';
+      return;
+    }
+    const s = _summariseBatch(j.results || []);
+    if (status) {
+      status.textContent = `✓ ${s.ok}/${s.total} updated — ${s.combinedRows.toLocaleString()} combined rows, ${s.realtimeRows.toLocaleString()} realtime rows. Reloading…`;
+    }
+    setTimeout(() => location.reload(), 1500);
+  } catch (e) {
+    if (status) status.textContent = 'Error: ' + e.message;
+    btn.disabled = false; btn.textContent = '⟳ Update all price data';
+  }
+}
+
+async function updateOneCompany(isin, btn) {
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '⏳';
+  try {
+    const r = await fetch(`/company/${isin}/update`, {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      btn.textContent = '⚠ ' + (j.error || 'failed').slice(0, 24);
+      setTimeout(() => { btn.disabled = false; btn.textContent = orig; }, 4000);
+      return;
+    }
+    const counts = j.summary && j.summary.counts ? j.summary.counts : {};
+    let newRows = 0;
+    for (const v of Object.values(counts)) {
+      const m = /\+(\d+)/.exec(String(v));
+      if (m) newRows += Number(m[1]);
+    }
+    btn.textContent = `✓ +${newRows}`;
+    setTimeout(() => location.reload(), 900);
+  } catch (e) {
+    btn.textContent = '⚠ ' + (e.message || 'error').slice(0, 24);
+    setTimeout(() => { btn.disabled = false; btn.textContent = orig; }, 4000);
+  }
+}
+
 async function scrapeAll(btn) {
   const status = document.getElementById('scrapeAllStatus');
   if (!confirm('Scrape ALL configured companies now? This can take 10+ minutes. Each company gets a new combined.csv and main_realtime.csv.')) return;
@@ -908,6 +1003,49 @@ document.addEventListener('click', e => {
   if (e.target.closest('.dropdown')) return;
   document.querySelectorAll('.dropdown-list.open').forEach(d => d.classList.remove('open'));
 });
+
+// ---------- company: incremental update ----------
+async function updatePriceData() {
+  const btn = document.getElementById('updateBtn');
+  const log = document.getElementById('runLog');
+  const link = document.getElementById('combinedLink');
+  const files = document.getElementById('sourceFiles');
+  btn.disabled = true; btn.textContent = '⏳ Updating…';
+  log.style.display = 'block';
+  log.textContent = 'Fetching missing dates…';
+  try {
+    const r = await fetch(`/company/${ISIN}/update`, {method:'POST'});
+    const j = await r.json();
+    if (!j.ok) {
+      log.textContent = 'Error: ' + (j.error || 'unknown');
+    } else {
+      const s = j.summary;
+      let txt = `Incremental update — total ${s.total} rows on disk\n\nPer-source (new / kept):\n`;
+      for (const [k,v] of Object.entries(s.counts)) txt += `  ${k.padEnd(14)} ${v}\n`;
+      if (s.realtime_rows != null) {
+        txt += `\nmain_realtime.csv: ${s.realtime_rows} rows (one per day, median price)\n`;
+      }
+      log.textContent = txt;
+      link.href = s.combined_url;
+      link.style.display = 'inline-block';
+      const rtLink = document.getElementById('realtimeLink');
+      if (rtLink && s.realtime_url) {
+        rtLink.href = s.realtime_url;
+        rtLink.style.display = 'inline-block';
+      }
+      document.getElementById('auditBtn').style.display = 'inline-block';
+      files.style.display = 'block';
+      files.innerHTML = '<div class="muted" style="margin-bottom:6px;">Per-source files:</div>' +
+        Object.entries(s.source_urls || {}).map(([src, url]) =>
+          `<a class="btn" style="margin:4px 6px 0 0;" href="${url}">${src}.csv</a>`
+        ).join('');
+      renderAudit(s.audit);
+    }
+  } catch (e) {
+    log.textContent = 'Error: ' + e.message;
+  }
+  btn.disabled = false; btn.textContent = '⟳ Update price data';
+}
 
 // ---------- company: run scraper ----------
 async function runScrape() {
@@ -1180,6 +1318,193 @@ function autoSearchAll(query) {
 function esc(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 // Discover page is a static download list — no JS required.
+
+// ---------- company page: price chart ----------
+let cpChart = null;
+let cpSource = "realtime";       // "realtime" | "combined" | "both"
+let cpRange  = "MAX";            // "1M" | "6M" | "1Y" | "3Y" | "MAX"
+const cpCache = {};              // {realtime: rows[], combined: rows[]}
+
+function cpSetSource(src, btn) {
+  cpSource = src;
+  document.querySelectorAll('#chartSourceTabs button').forEach(b => {
+    b.classList.toggle('primary', b.dataset.src === src);
+    b.classList.toggle('ghost',   b.dataset.src !== src);
+  });
+  cpRender();
+}
+function cpSetRange(r, btn) {
+  cpRange = r;
+  document.querySelectorAll('#chartRangeTabs button').forEach(b => {
+    b.classList.toggle('primary', b.dataset.range === r);
+    b.classList.toggle('ghost',   b.dataset.range !== r);
+  });
+  cpRender();
+}
+
+const _CP_RANGE_DAYS = {"1M": 30, "6M": 182, "1Y": 365, "3Y": 365*3};
+
+async function cpFetch(src) {
+  if (cpCache[src]) return cpCache[src];
+  const r = await fetch(`/company/${ISIN}/chart-data?source=${src}`);
+  const j = await r.json();
+  cpCache[src] = j.ok ? j : {rows: [], error: j.error || 'failed'};
+  return cpCache[src];
+}
+
+function cpFilterByRange(rows) {
+  if (cpRange === "MAX" || !rows.length) return rows;
+  const days = _CP_RANGE_DAYS[cpRange];
+  if (!days) return rows;
+  // Find latest timestamp, filter back N days
+  const latest = new Date(rows[rows.length-1].t).getTime();
+  const cutoff = latest - days * 86400 * 1000;
+  return rows.filter(r => new Date(r.t).getTime() >= cutoff);
+}
+
+async function cpRender() {
+  const status = document.getElementById('chartStatus');
+  if (!cpChart) cpChart = echarts.init(document.getElementById('priceChart'), null, {renderer:'canvas'});
+  status.textContent = 'loading…';
+  // Fetch both if 'both', else just one
+  const fetches = (cpSource === 'both') ? ['realtime','combined'] : [cpSource];
+  const data = {};
+  for (const s of fetches) data[s] = await cpFetch(s);
+
+  // Note type → marker colour
+  function cpNoteColor(note) {
+    if (!note) return null;
+    if (note.includes('anchor'))           return '#f0a940';  // amber
+    if (note.includes('carried forward'))  return '#7cadde';  // steel-blue
+    if (note.includes('rolling'))          return '#b08aff';  // purple
+    return '#8a93a6';                                          // grey
+  }
+
+  const series = [];
+  let totalRows = 0;
+  // Track whether any realtime noted rows exist (for the legend chip)
+  let hasNotes = false;
+
+  for (const [s, j] of Object.entries(data)) {
+    const rows = cpFilterByRange(j.rows || []);
+    totalRows += rows.length;
+    if (s === 'realtime') {
+      series.push({
+        name: 'main_realtime (cleaned)',
+        type: 'line',
+        showSymbol: false,
+        sampling: 'lttb',
+        smooth: false,
+        lineStyle: {color: '#36c48d', width: 1.5},
+        itemStyle: {color: '#36c48d'},
+        data: rows.map(r => [r.t, r.p, r.n]),
+      });
+      // Overlay: one dot per noted point — anchor/carried-forward/smoothed
+      const noted = rows.filter(r => r.n);
+      if (noted.length) {
+        hasNotes = true;
+        series.push({
+          name: '_noted',              // underscore = hidden from legend/tooltip
+          type: 'scatter',
+          z: 10,
+          symbolSize: 7,
+          itemStyle: {
+            color: params => cpNoteColor((params.data && params.data[2]) || '') || '#8a93a6',
+            borderColor: '#171a21',
+            borderWidth: 1,
+          },
+          tooltip: {show: false},     // notes shown via main line tooltip
+          data: noted.map(r => [r.t, r.p, r.n]),
+        });
+      }
+    } else {
+      series.push({
+        name: 'combined (raw)',
+        type: 'scatter',     // raw points — show every per-source row as a dot
+        symbolSize: 3,
+        itemStyle: {color: 'rgba(124,196,255,0.55)'},
+        data: rows.map(r => [r.t, r.p, r.n]),
+      });
+    }
+  }
+
+  cpChart.setOption({
+    backgroundColor: 'transparent',
+    grid: {left: 50, right: 16, top: 16, bottom: 50},
+    tooltip: {
+      trigger: 'axis',
+      backgroundColor: '#171a21',
+      borderColor: '#272b35',
+      textStyle: {color: '#e6e9ef'},
+      formatter: (params) => {
+        const lines = params
+          .filter(p => !p.seriesName.startsWith('_'))   // skip internal overlay series
+          .map(p => {
+            const note = (p.data && p.data[2]) ? p.data[2] : '';
+            const noteColor = cpNoteColor(note) || '#8a93a6';
+            const noteHtml = note
+              ? `<br><span style="color:${noteColor};font-size:11px;">⚑ ${note}</span>`
+              : '';
+            return `<span style="color:${p.color}">●</span> ${p.seriesName}: ₹${Number(p.value[1]).toLocaleString('en-IN', {maximumFractionDigits:2})}${noteHtml}`;
+          }).join('<br>');
+        const d = params[0] ? new Date(params[0].value[0]).toLocaleDateString('en-IN', {day:'2-digit',month:'short',year:'numeric'}) : '';
+        return `<strong>${d}</strong><br>${lines}`;
+      },
+    },
+    legend: {top: 0, right: 8, textStyle: {color: '#8a93a6'}, show: cpSource === 'both'},
+    xAxis: {
+      type: 'time',
+      axisLine: {lineStyle: {color: '#272b35'}},
+      axisLabel: {color: '#8a93a6'},
+      splitLine: {show: false},
+    },
+    yAxis: {
+      type: 'value',
+      scale: true,
+      axisLine: {lineStyle: {color: '#272b35'}},
+      axisLabel: {color: '#8a93a6', formatter: '₹{value}'},
+      splitLine: {lineStyle: {color: '#1b1f28'}},
+    },
+    dataZoom: [
+      {type: 'inside', throttle: 50},
+      {type: 'slider', height: 20, bottom: 8, borderColor: '#272b35',
+       textStyle: {color: '#8a93a6'}, fillerColor: 'rgba(124,196,255,0.15)'},
+    ],
+    series,
+  }, true);
+
+  // Status line
+  const sLabel = cpSource === 'both' ? 'realtime + combined' : cpSource;
+  const counts = Object.entries(data).map(([k,v]) => `${k}=${(v.rows||[]).length}`).join(', ');
+  status.textContent = `${sLabel} · ${cpRange} · plotted ${totalRows} pts (raw: ${counts})`;
+
+  // Legend with file names + note-type key
+  const legend = document.getElementById('chartLegend');
+  const fileNames = Object.entries(data).map(([k,v]) =>
+    `<span style="margin-right:14px;">${esc(k)}: ${esc(v.filename || '—')}</span>`
+  ).join('');
+  const noteKey = hasNotes
+    ? `<span style="margin-left:8px; border-left:1px solid #272b35; padding-left:10px;">` +
+      `<span style="color:#f0a940;">●</span> anchor &nbsp;` +
+      `<span style="color:#7cadde;">●</span> carried fwd &nbsp;` +
+      `<span style="color:#b08aff;">●</span> smoothed` +
+      `</span>`
+    : '';
+  legend.innerHTML = fileNames + noteKey;
+}
+
+if (ISIN) {
+  // Defer until ECharts is loaded
+  const _waitEcharts = () => {
+    if (typeof echarts === 'undefined') {
+      setTimeout(_waitEcharts, 50);
+    } else {
+      cpRender();
+      window.addEventListener('resize', () => cpChart && cpChart.resize());
+    }
+  };
+  document.addEventListener('DOMContentLoaded', _waitEcharts);
+}
 
 // ---------- /isin-check page ----------
 const IC_VIEW = {% if view == 'isin_check' %}true{% else %}false{% endif %};
@@ -1474,153 +1799,6 @@ function _cdRenderDiscrepancies(j) {
     }).join('')}`;
 }
 
-// ---------- home: ISIN validator ----------
-const ISIN_SOURCES = ["planify", "unlistedzone", "wwipl", "incredmoney", "sharescart", "altius", "altmoneyvault"];
-
-async function runIsinCheck() {
-  const btn = document.getElementById('isinCheckBtn');
-  const status = document.getElementById('isinCheckStatus');
-  const box = document.getElementById('isinCheckResults');
-  if (!btn) return;
-  btn.disabled = true;
-  btn.textContent = '⏳ Checking… (~45s)';
-  if (status) status.textContent = 'fetching every source page + parsing ISINs in parallel…';
-  box.style.display = 'none';
-  box.innerHTML = '';
-  try {
-    const r = await fetch('/admin/check-isins', {method:'POST'});
-    const j = await r.json();
-    if (!j.ok) {
-      if (status) status.textContent = 'Error: ' + (j.error || 'unknown');
-    } else {
-      renderIsinResults(j);
-      const s = j.summary;
-      if (status) status.textContent =
-        `${s.matches}/${s.total} match · ${s.mismatches} mismatch · ${s.errors} error${s.errors===1?'':'s'}`;
-    }
-  } catch (e) {
-    if (status) status.textContent = 'Error: ' + e.message;
-  }
-  btn.disabled = false;
-  btn.textContent = '▶ Check all ISINs';
-}
-
-function renderIsinResults(j) {
-  const box = document.getElementById('isinCheckResults');
-  // Build a matrix: row per company, column per source.
-  //   green  → source reports the registered ISIN (match)
-  //   red    → source reports a *different* ISIN (mismatch, strong discrepancy)
-  //   orange → source page has no ISIN at all (discrepancy — usually wrong slug)
-  //   gray   → network/HTTP error (neither match nor mismatch; need to retry)
-  //   blank  → no slug configured for that source
-  const cellStyle = {
-    match:    'color:var(--accent2);',
-    mismatch: 'color:var(--danger); background:rgba(255,107,107,0.12); font-weight:600;',
-    missing:  'color:#f59e0b; background:rgba(245,158,11,0.12); font-weight:600;',
-    error:    'color:var(--muted); background:rgba(138,147,166,0.10);',
-    none:     'color:var(--muted);',
-  };
-  const thead = `
-    <thead>
-      <tr>
-        <th style="width:140px;">ISIN (registered)</th>
-        <th>Company</th>
-        ${ISIN_SOURCES.map(s => `<th style="min-width:140px;">${esc(s)}</th>`).join('')}
-        <th style="width:70px;">Status</th>
-      </tr>
-    </thead>`;
-  const rows = j.companies.map(co => {
-    let hadMismatch = false, hadMissing = false, hadError = false, hadConfigured = false;
-    const cells = ISIN_SOURCES.map(src => {
-      const ck = co.checks.find(c => c.source === src);
-      if (!ck) return `<td style="${cellStyle.none}; font-size:11px;" title="not configured">—</td>`;
-      hadConfigured = true;
-      if (ck.error) {
-        hadError = true;
-        return `<td style="${cellStyle.error}; font-size:11px;" title="${esc(ck.error)}">⚠ error</td>`;
-      }
-      const found = (ck.found && ck.found.length) ? ck.found[0] : null;
-      if (!found) {
-        hadMissing = true;
-        return `<td style="${cellStyle.missing}; font-size:11px;" title="no ISIN on page — probably wrong slug\nurl: ${esc(ck.url||'')}">✗ none on page</td>`;
-      }
-      const ok = ck.match;
-      if (!ok) hadMismatch = true;
-      const title = (ck.found || []).length > 1
-        ? `also found: ${ck.found.slice(1).join(', ')}\nurl: ${ck.url||''}`
-        : `url: ${ck.url||''}`;
-      const extra = (ck.found || []).length > 1 ? ` <span class="muted">(+${ck.found.length-1})</span>` : '';
-      return `<td title="${esc(title)}" style="font-family:ui-monospace,monospace; font-size:12px; ${ok ? cellStyle.match : cellStyle.mismatch}">${ok?'✓ ':'✗ '}${esc(found)}${extra}</td>`;
-    }).join('');
-    let statusBadge;
-    if (!hadConfigured) {
-      statusBadge = `<span class="status-pill warn">no slugs</span>`;
-    } else if (hadMismatch || hadMissing) {
-      const label = hadMismatch ? 'mismatch' : 'missing';
-      statusBadge = `<span class="status-pill warn">✗ ${label}</span>`;
-    } else if (hadError) {
-      statusBadge = `<span class="status-pill warn">partial</span>`;
-    } else {
-      statusBadge = `<span class="status-pill ok">✓ ok</span>`;
-    }
-    return `<tr data-bad="${hadMismatch || hadMissing ? '1' : '0'}">
-      <td style="font-family:ui-monospace,monospace; font-weight:600;">${esc(co.isin)}</td>
-      <td><a href="/company/${esc(co.isin)}">${esc(co.name)}</a></td>
-      ${cells}
-      <td>${statusBadge}</td>
-    </tr>`;
-  }).join('');
-
-  // Discrepancy shortlist — includes both real mismatches AND "no ISIN on page"
-  // entries (since both usually mean the slug or the registered ISIN is wrong).
-  const bad = j.companies.filter(co =>
-    co.checks.some(c => !c.match && !c.error)
-  );
-  const discHtml = bad.length ? `
-    <h3 style="margin:18px 0 6px; font-size:13px; text-transform:uppercase; color:var(--muted);">
-      ${bad.length} companies with at least one discrepancy
-      <span class="muted" style="text-transform:none; letter-spacing:0; font-weight:normal;">
-        — red = different ISIN, orange = no ISIN on page
-      </span>
-    </h3>
-    ${bad.map(co => {
-      const conflicts = co.checks.filter(c => !c.match && !c.error);
-      return `<div style="padding:10px 12px; border:1px solid var(--border); border-radius:8px; margin-bottom:8px; background:#12151c;">
-        <div><a href="/company/${esc(co.isin)}" style="font-weight:600;">${esc(co.name)}</a> <span class="muted">· registered <code>${esc(co.isin)}</code></span></div>
-        ${conflicts.map(c => {
-          const found = (c.found||[]).join(', ');
-          const kind = found ? 'mismatch' : 'missing';
-          const color = found ? 'var(--danger)' : '#f59e0b';
-          const label = found ? `page shows <code style="color:${color};">${esc(found)}</code>` : `<span style="color:${color};">no ISIN on page (slug likely wrong)</span>`;
-          return `<div class="muted" style="font-size:12px; margin-top:6px;">
-            <span class="status-pill ${kind === 'mismatch' ? 'warn' : 'warn'}" style="font-size:10px;">${kind}</span>
-            <strong style="color:var(--text); margin-left:4px;">${esc(c.source)}</strong>:
-            ${label}
-            · slug <code>${esc(c.slug||'')}</code>
-            ${c.url ? `· <a target="_blank" rel="noopener" href="${esc(c.url)}">↗ open</a>` : ''}
-          </div>`;
-        }).join('')}
-      </div>`;
-    }).join('')}` : '<p class="muted">No discrepancies found — every registered ISIN is visible on every source page.</p>';
-
-  // Count totals for the legend
-  const totalMismatch = j.companies.reduce((s,co) => s + co.checks.filter(c => !c.match && !c.error && c.found && c.found.length).length, 0);
-  const totalMissing  = j.companies.reduce((s,co) => s + co.checks.filter(c => !c.match && !c.error && (!c.found || !c.found.length)).length, 0);
-  const totalError    = j.companies.reduce((s,co) => s + co.checks.filter(c => c.error).length, 0);
-
-  box.style.display = 'block';
-  box.innerHTML = `
-    <div class="inline" style="gap:14px; margin-bottom:10px; font-size:12px;">
-      <span><span style="display:inline-block;width:10px;height:10px;background:var(--accent2);border-radius:2px;"></span> match · ${j.summary.matches}</span>
-      <span><span style="display:inline-block;width:10px;height:10px;background:var(--danger);border-radius:2px;"></span> mismatch · ${totalMismatch}</span>
-      <span><span style="display:inline-block;width:10px;height:10px;background:#f59e0b;border-radius:2px;"></span> no ISIN on page · ${totalMissing}</span>
-      <span><span style="display:inline-block;width:10px;height:10px;background:#8a93a6;border-radius:2px;"></span> fetch error · ${totalError}</span>
-    </div>
-    <div style="overflow-x:auto;">
-      <table style="font-size:12px;">${thead}<tbody>${rows}</tbody></table>
-    </div>
-    ${discHtml}`;
-}
 </script>
 </body>
 </html>

@@ -26,10 +26,12 @@ import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 
 import requests
 from flask import (
     Flask,
+    Response,
     abort,
     jsonify,
     render_template,
@@ -244,18 +246,21 @@ def get_company(isin):
     return company_row_to_dict(row, aliases)
 
 
+def _count_rows(path: pathlib.Path) -> int:
+    """Line count minus header. Returns 0 on read error."""
+    try:
+        with path.open("rb") as fp:
+            n = sum(1 for _ in fp)
+        return max(0, n - 1)
+    except OSError:
+        return 0
+
+
 def _scrape_status(isin):
     """Inspect extracted/{ISIN}/ to report what's been scraped.
 
-    Returns a dict with:
-      combined_exists  — True if a *_combined.csv sits at the folder root
-      combined_rows    — row count of that CSV (excluding header)
-      combined_name    — its filename
-      combined_mtime   — ISO timestamp of last modification
-      realtime_exists  — True if a *_main_realtime.csv sits at the folder root
-      realtime_name    — its filename
-      realtime_rows    — row count (one per day) of that CSV
-      source_count     — number of per-source CSVs present
+    Returns a dict with combined / realtime / per-source presence + row counts.
+    Uses a single iterdir() pass instead of three globs.
     """
     folder = scrape_prices._find_extracted_folder(isin.upper())
     status = {
@@ -270,60 +275,40 @@ def _scrape_status(isin):
     }
     if folder is None or not folder.exists():
         return status
-    # combined file — take the newest *_combined.csv at folder root
-    combined_files = sorted(
-        folder.glob("*_combined.csv"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    # also check legacy `combined.csv` just in case
-    legacy = folder / "combined.csv"
-    if legacy.exists() and legacy not in combined_files:
-        combined_files.append(legacy)
-    if combined_files:
-        cf = combined_files[0]
+    combined_candidates: list[pathlib.Path] = []
+    realtime_candidates: list[pathlib.Path] = []
+    legacy_source_count = 0
+    for p in folder.iterdir():
+        if not p.is_file():
+            continue
+        n = p.name
+        if n.endswith("_combined.csv") or n == "combined.csv":
+            combined_candidates.append(p)
+        elif n.endswith("_main_realtime.csv"):
+            realtime_candidates.append(p)
+        elif n.endswith(".csv"):
+            # Legacy flat layout — per-source CSV at folder root.
+            legacy_source_count += 1
+    if combined_candidates:
+        cf = max(combined_candidates, key=lambda p: p.stat().st_mtime)
         status["combined_exists"] = True
         status["combined_name"] = cf.name
-        stat = cf.stat()
         status["combined_mtime"] = time.strftime(
-            "%Y-%m-%d %H:%M", time.localtime(stat.st_mtime)
+            "%Y-%m-%d %H:%M", time.localtime(cf.stat().st_mtime)
         )
-        # row count (cheap): -1 for header if > 0
-        try:
-            with cf.open() as fp:
-                rows = sum(1 for _ in fp)
-            status["combined_rows"] = max(0, rows - 1)
-        except OSError:
-            pass
-    # main_realtime file — same pattern
-    realtime_files = sorted(
-        folder.glob("*_main_realtime.csv"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if realtime_files:
-        rf = realtime_files[0]
+        status["combined_rows"] = _count_rows(cf)
+    if realtime_candidates:
+        rf = max(realtime_candidates, key=lambda p: p.stat().st_mtime)
         status["realtime_exists"] = True
         status["realtime_name"] = rf.name
-        try:
-            with rf.open() as fp:
-                rows = sum(1 for _ in fp)
-            status["realtime_rows"] = max(0, rows - 1)
-        except OSError:
-            pass
-    # per-source files under sources/ (new layout) or folder root (legacy)
+        status["realtime_rows"] = _count_rows(rf)
     sources_dir = folder / "sources"
     if sources_dir.exists():
         status["source_count"] = sum(
-            1 for p in sources_dir.glob("*.csv") if p.is_file()
+            1 for p in sources_dir.iterdir() if p.suffix == ".csv" and p.is_file()
         )
     else:
-        status["source_count"] = sum(
-            1 for p in folder.glob("*.csv")
-            if p.is_file() and not p.name.endswith("_combined.csv")
-            and not p.name.endswith("_main_realtime.csv")
-            and p.name != "combined.csv"
-        )
+        status["source_count"] = legacy_source_count
     return status
 
 
@@ -1170,24 +1155,9 @@ def update_slug(isin):
     return jsonify({"ok": True, "slugs": slugs})
 
 
-@app.route("/company/<isin>/run", methods=["POST"])
-def run_scraper(isin):
-    isin = isin.upper()
-    company = get_company(isin)
-    if not company:
-        abort(404)
-    sources = {k: v for k, v in company["slugs"].items() if v}
-    if not sources:
-        return jsonify({"ok": False, "error": "No slugs configured"}), 400
-    try:
-        summary = scrape_prices.scrape(
-            isin,
-            sources,
-            excluded=company["excluded"],
-            company_name=company.get("display_name", ""),
-        )
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+def _enrich_scrape_summary(summary: dict, isin: str, sources: dict) -> dict:
+    """Add download URLs + audit results to a scrape() / scrape_incremental()
+    summary so the UI can render links without a second round-trip."""
     files = summary.get("files", {}) or {}
     combined_name = files.get("combined_name") or pathlib.Path(
         summary.get("combined") or ""
@@ -1208,7 +1178,58 @@ def run_scraper(isin):
         summary["audit"] = scrape_prices.audit_sources(isin)
     except Exception as e:
         summary["audit_error"] = str(e)
+    return summary
+
+
+def _bump_last_run(isin: str) -> None:
+    try:
+        with db() as c:
+            c.execute(
+                "UPDATE companies SET auto_scrape_last_run=? WHERE isin=?",
+                (datetime.now(timezone.utc).isoformat(timespec="seconds"), isin),
+            )
+            c.commit()
+    except Exception:
+        pass
+
+
+def _scrape_one(isin: str, *, incremental: bool):
+    """Shared body of /run and /update routes."""
+    isin = isin.upper()
+    company = get_company(isin)
+    if not company:
+        abort(404)
+    sources = {k: v for k, v in company["slugs"].items() if v}
+    if not sources:
+        return jsonify({"ok": False, "error": "No slugs configured"}), 400
+    fn = scrape_prices.scrape_incremental if incremental else scrape_prices.scrape
+    try:
+        summary = fn(
+            isin,
+            sources,
+            excluded=company["excluded"],
+            company_name=company.get("display_name", ""),
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    _enrich_scrape_summary(summary, isin, sources)
+    if incremental:
+        _bump_last_run(isin)
     return jsonify({"ok": True, "summary": summary})
+
+
+@app.route("/company/<isin>/run", methods=["POST"])
+def run_scraper(isin):
+    return _scrape_one(isin, incremental=False)
+
+
+@app.route("/company/<isin>/update", methods=["POST"])
+def update_scraper(isin):
+    """Incremental update — fetches each source and appends only rows on
+    dates not already in the per-source CSV. Existing data is preserved.
+    Same response shape as /company/<isin>/run so the UI renders results
+    identically."""
+    return _scrape_one(isin, incremental=True)
 
 
 @app.route("/company/<isin>/audit")
@@ -1340,6 +1361,23 @@ def run_auto_scrape_now():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/admin/update-all", methods=["POST"])
+def run_update_all():
+    """Incremental batch — same set of companies as /admin/scrape-all
+    (every company with at least one configured slug), but appends only
+    missing dates to each per-source CSV instead of overwriting."""
+    try:
+        result = _run_scrape_batch(
+            _all_scrape_targets(),
+            label="update-all",
+            bump_last_run=True,
+            incremental=True,
+        )
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/admin/scrape-all", methods=["POST"])
 def run_scrape_all():
     """Scrape every company that has at least one configured slug. Writes
@@ -1391,16 +1429,13 @@ def source_catalog_download(source):
     if source not in SOURCES:
         abort(404)
     rows = _source_catalog_rows(source)
-    from io import StringIO
     buf = StringIO()
     w = csv.writer(buf)
     w.writerow(["slug", "display", "url"])
     for slug, display, url in rows:
         w.writerow([slug, display, url])
-    payload = buf.getvalue().encode("utf-8")
-    from flask import Response
     return Response(
-        payload,
+        buf.getvalue().encode("utf-8"),
         mimetype="text/csv",
         headers={
             "Content-Disposition": f'attachment; filename="{source}-companies.csv"'
@@ -1445,7 +1480,6 @@ def download_company_data_csv():
             "incorporated_on, pan, updated_at "
             "FROM companies ORDER BY display_name"
         ).fetchall()
-    from io import StringIO
     buf = StringIO()
     w = csv.writer(buf)
     w.writerow(["ISIN", "Company", "CIN", "RTA", "Face Value",
@@ -1457,13 +1491,64 @@ def download_company_data_csv():
             r["incorporated_on"] or "", r["pan"] or "",
             r["updated_at"] or "",
         ])
-    payload = buf.getvalue().encode("utf-8")
-    from flask import Response
     return Response(
-        payload,
+        buf.getvalue().encode("utf-8"),
         mimetype="text/csv",
         headers={"Content-Disposition": 'attachment; filename="company-data.csv"'},
     )
+
+
+@app.route("/company/<isin>/chart-data")
+def company_chart_data(isin):
+    """Return per-day price points as JSON for the company-page chart.
+
+    Query params:
+      source = realtime | combined  (default: realtime)
+        realtime → reads `_main_realtime.csv` (one mean-blended row per day,
+                   noise-reduced)
+        combined → reads `_combined.csv` (every per-source row, raw)
+    """
+    isin = isin.upper()
+    if not get_company(isin):
+        abort(404)
+    source = (request.args.get("source") or "realtime").lower()
+    if source not in ("realtime", "combined"):
+        abort(400, "source must be 'realtime' or 'combined'")
+    folder = scrape_prices._find_extracted_folder(isin)
+    if folder is None or not folder.exists():
+        return jsonify({"ok": True, "source": source, "rows": [], "note": "no folder"})
+    suffix = "_main_realtime.csv" if source == "realtime" else "_combined.csv"
+    matches = sorted(folder.glob(f"*{suffix}"))
+    if not matches:
+        return jsonify({"ok": True, "source": source, "rows": [],
+                         "note": f"no {suffix} on disk yet"})
+    path = matches[0]
+    rows = []
+    try:
+        with path.open() as fp:
+            reader = csv.DictReader(fp)
+            for r in reader:
+                # Both files share schema: datetime,price,note,link,category
+                dt = (r.get("datetime") or "").strip()
+                try:
+                    price = float(r.get("price") or "")
+                except (TypeError, ValueError):
+                    continue
+                rows.append({
+                    "t": dt,
+                    "p": price,
+                    "n": (r.get("note") or "").strip(),
+                })
+    except OSError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+    rows.sort(key=lambda x: x["t"])
+    return jsonify({
+        "ok": True,
+        "source": source,
+        "filename": path.name,
+        "rows": rows,
+        "count": len(rows),
+    })
 
 
 @app.route("/company/<isin>/data", methods=["POST"])
@@ -1541,8 +1626,6 @@ def run_isin_check():
         check_isins.write_csv(res, HERE / "isin_check.csv")
         check_isins.write_matrix_csv(res, HERE / "isin_check_matrix.csv")
         check_isins.write_json(res, HERE / "isin_check.json")
-        # Include the generated_at stamp in the response too
-        from datetime import datetime, timezone
         return jsonify({
             "ok": True,
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1586,17 +1669,14 @@ def download_isin_check_matrix_csv():
 @app.route("/admin/sources/all/list.csv")
 def all_catalogs_download():
     """Combined CSV across every source — source,slug,display,url."""
-    from io import StringIO
     buf = StringIO()
     w = csv.writer(buf)
     w.writerow(["source", "slug", "display", "url"])
     for src in SOURCES:
         for slug, display, url in _source_catalog_rows(src):
             w.writerow([src, slug, display, url])
-    payload = buf.getvalue().encode("utf-8")
-    from flask import Response
     return Response(
-        payload,
+        buf.getvalue().encode("utf-8"),
         mimetype="text/csv",
         headers={"Content-Disposition": 'attachment; filename="all-sources-companies.csv"'},
     )
