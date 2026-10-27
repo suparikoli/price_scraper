@@ -37,3 +37,5 @@ logs/
 .DS_Store
 Thumbs.db
 graphify-out/
+# kept local (2026-10-27)
+/registry.db
